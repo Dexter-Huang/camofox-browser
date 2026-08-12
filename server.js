@@ -733,36 +733,74 @@ function scheduleBrowserWarmRetry(delayMs = 5000) {
 }
 
 // --- Browser health tracking ---
+// Per-user navigation health. Each user gets an independent failure counter so
+// interleaved failures from different users don't corrupt each other's
+// recovery state. Process-global fields (activeOps, isRecovering,
+// lastSuccessfulNav) remain on the shared object for the health probe and
+// /health endpoint.
+const userNavHealth = new Map();
 const healthState = {
-  consecutiveNavFailures: 0,
-  lastSuccessfulNav: Date.now(),
   isRecovering: false,
   activeOps: 0,
+  lastSuccessfulNav: Date.now(),
 };
 
-function recordNavSuccess() {
-  healthState.consecutiveNavFailures = 0;
+function getUserNavHealth(userId) {
+  const key = normalizeUserId(userId);
+  let h = userNavHealth.get(key);
+  if (!h) {
+    h = { consecutiveNavFailures: 0 };
+    userNavHealth.set(key, h);
+  }
+  return h;
+}
+
+function deleteUserNavHealth(userId) {
+  userNavHealth.delete(normalizeUserId(userId));
+}
+
+function recordNavSuccess(userId) {
+  if (userId) {
+    const h = getUserNavHealth(userId);
+    h.consecutiveNavFailures = 0;
+  }
   healthState.lastSuccessfulNav = Date.now();
 }
 
-function recordNavFailure() {
-  healthState.consecutiveNavFailures++;
-  return healthState.consecutiveNavFailures >= FAILURE_THRESHOLD;
+function recordNavFailure(userId) {
+  if (!userId) return false;
+  const h = getUserNavHealth(userId);
+  h.consecutiveNavFailures++;
+  return h.consecutiveNavFailures >= FAILURE_THRESHOLD;
+}
+
+async function recoverUserSession(userId, reason) {
+  const key = normalizeUserId(userId);
+  log('warn', 'recovering user session after nav failure threshold', {
+    userId: key, reason, failures: getUserNavHealth(key).consecutiveNavFailures,
+  });
+  browserRestartsTotal.labels('nav_failure_recovery').inc();
+  await destroySession(key, { reason: `nav_failure_recovery:${reason}` });
+  deleteUserNavHealth(key);
 }
 
 async function restartBrowser(reason) {
   if (healthState.isRecovering) return;
   healthState.isRecovering = true;
   browserRestartsTotal.labels(reason).inc();
-  log('error', 'restarting browser', { reason, failures: healthState.consecutiveNavFailures });
+  const totalFailures = Array.from(userNavHealth.values())
+    .reduce((sum, h) => sum + h.consecutiveNavFailures, 0);
+  log('error', 'restarting browser', { reason, totalFailures });
   pluginEvents.emit('browser:restart', { reason });
   try {
     await closeAllSessions(`browser_restart:${reason}`, { clearDownloads: true, clearLocks: true });
+    userNavHealth.clear();
     await closeBrowserFully(`browser_restart:${reason}`);
     pluginEvents.emit('browser:closed', { reason });
-    browserLaunchPromise = null;
+    // Do NOT clear browserLaunchPromise here — ensureBrowser() owns the
+    // single-flight primitive. Clearing it manually opens a window where a
+    // concurrent request can start a second launch. See #8554.
     await ensureBrowser();
-    healthState.consecutiveNavFailures = 0;
     healthState.lastSuccessfulNav = Date.now();
     log('info', 'browser restarted successfully');
   } catch (err) {
@@ -1436,6 +1474,7 @@ function handleRouteError(err, req, res, extraFields = {}) {
       action, userId, error: err.message,
     });
     browserRestartsTotal.labels('navigation_timeout').inc();
+    recordNavFailure(userId);
     destroySession(userId).catch(() => {});
   }
   // Track consecutive timeouts per tab and auto-destroy stuck tabs
@@ -1575,6 +1614,7 @@ async function destroySession(userId, { reason = 'destroy_session' } = {}) {
   if (!session) return false;
   log('warn', 'destroying session', { userId: key, reason });
   sessions.delete(key);
+  deleteUserNavHealth(key);
   await closeSession(key, session, { reason, clearDownloads: true, clearLocks: true });
   return true;
 }
@@ -2539,7 +2579,8 @@ app.get('/health', (req, res) => {
     browserRunning: running,
     activeTabs: getTotalTabCount(),
     activeSessions: sessions.size,
-    consecutiveFailures: healthState.consecutiveNavFailures,
+    consecutiveFailures: Array.from(userNavHealth.values())
+      .reduce((sum, h) => sum + h.consecutiveNavFailures, 0),
     memory: { rssMb, heapUsedMb, nativeMemMb },
     ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
   });
@@ -2793,6 +2834,7 @@ app.post('/tabs', async (req, res) => {
         tabState.lastRequestedUrl = url;
         try {
           await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+          recordNavSuccess(userId);
         } catch (navErr) {
           if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
             log('warn', 'tab create navigate failed, retrying with fresh proxy', {
@@ -2815,7 +2857,11 @@ app.post('/tabs', async (req, res) => {
             attachPopupHandler(retryPage, userId, resolvedSessionKey);
             refreshActiveTabsGauge();
             await withPageLoadDuration('open_url', () => retryPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+            recordNavSuccess(userId);
           } else {
+            if (recordNavFailure(userId)) {
+              await recoverUserSession(userId, 'tab_create_nav_failure');
+            }
             throw navErr;
           }
         }
@@ -3003,6 +3049,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
         // get a fresh proxy, and retry once before failing to the caller.
         try {
           await navigateCurrentPage();
+          recordNavSuccess(userId);
         } catch (navErr) {
           if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
             log('warn', 'navigate failed, retrying with fresh proxy session', {
@@ -3012,7 +3059,11 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
             await recreateTabOnFreshContext();
             if (isGoogleSearch) await prewarmGoogleHome();
             await navigateCurrentPage();
+            recordNavSuccess(userId);
           } else {
+            if (recordNavFailure(userId)) {
+              await recoverUserSession(userId, 'navigate_failure');
+            }
             throw navErr;
           }
         }
@@ -5764,6 +5815,7 @@ app.post('/tabs/open', async (req, res) => {
     
     try {
       await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+      recordNavSuccess(userId);
     } catch (navErr) {
       if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
         log('warn', 'tab open failed, retrying with fresh proxy', {
@@ -5785,7 +5837,11 @@ app.post('/tabs/open', async (req, res) => {
         attachPopupHandler(page, userId, listItemId);
         refreshActiveTabsGauge();
         await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+        recordNavSuccess(userId);
       } else {
+        if (recordNavFailure(userId)) {
+          await recoverUserSession(userId, 'tab_open_nav_failure');
+        }
         throw navErr;
       }
     }
@@ -5954,6 +6010,7 @@ app.post('/navigate', async (req, res) => {
     
     const result = await withTabLock(targetId, async () => {
       await withPageLoadDuration('navigate', () => tabState.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+      recordNavSuccess(userId);
       tabState.visitedUrls.add(url);
       tabState.lastSnapshot = null;
       
@@ -5970,6 +6027,9 @@ app.post('/navigate', async (req, res) => {
     res.json(result);
   } catch (err) {
     log('error', 'openclaw navigate failed', { reqId: req.reqId, error: err.message });
+    if (recordNavFailure(req.body?.userId)) {
+      await recoverUserSession(req.body.userId, 'openclaw_navigate_failure');
+    }
     handleRouteError(err, req, res);
   }
 });
