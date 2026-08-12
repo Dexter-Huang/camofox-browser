@@ -6144,7 +6144,7 @@ setInterval(async () => {
   
   let testContext;
   try {
-    testContext = await browser.newContext();
+    testContext = await browser.newContext({ viewport: null });
     const page = await testContext.newPage();
     await page.goto('about:blank', { timeout: 5000 });
     await page.close();
