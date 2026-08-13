@@ -1,4 +1,8 @@
-FROM node:22-slim AS camofox-browser
+# Trixie (glibc 2.41), not bookworm (2.36): better-sqlite3 ships an arm64 prebuild
+# linked against GLIBC_2.38, so on bookworm it loads and then dies at runtime with
+# "version `GLIBC_2.38' not found" the first time a tab is opened. amd64 is
+# unaffected because that prebuild targets an older glibc.
+FROM node:22-trixie-slim AS camofox-browser
 
 # Pinned Camoufox version for reproducible builds
 # Update these when upgrading Camoufox
@@ -25,7 +29,8 @@ RUN apt-get update && apt-get install -y \
     libxtst6 \
     # Mesa OpenGL/EGL for WebGL support (software rendering via llvmpipe)
     # Without these, Firefox cannot create WebGL contexts -- a major bot detection signal
-    libegl1-mesa \
+    # libegl1 -- named libegl1-mesa on bookworm, dropped in trixie
+    libegl1 \
     libgl1-mesa-dri \
     libgbm1 \
     # Xvfb virtual display -- runs Camoufox as if on a real desktop (better anti-detection)
@@ -60,7 +65,16 @@ WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY scripts/ ./scripts/
-RUN npm ci --omit=dev
+# better-sqlite3 has no prebuild matching this node/arch, so npm ci falls back to
+# `node-gyp rebuild`, which fails on node:*-slim with "Error: not found: make".
+# Install a toolchain for the build and purge it in the same layer so it does not
+# land in the image. Independent of the glibc issue noted at the FROM line: this
+# one fails at build time on any Debian release, that one at runtime on bookworm.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential python3 \
+    && npm ci --omit=dev \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY server.js ./
 COPY camofox.config.json ./
