@@ -1927,6 +1927,7 @@ async function waitForPageReady(page, options = {}) {
     settleMs = 200,
     hydrationPollMs = 250,
     hydrationTimeoutMs = Math.min(timeout, 10000),
+    dismissConsent = false,
   } = options;
   
   try {
@@ -1961,8 +1962,9 @@ async function waitForPageReady(page, options = {}) {
       await page.waitForTimeout(settleMs);
     }
     
-    // Auto-dismiss common consent/privacy dialogs
-    await dismissConsentDialogs(page);
+    if (dismissConsent) {
+      await dismissConsentDialogs(page);
+    }
     
     return true;
   } catch (err) {
@@ -1972,33 +1974,15 @@ async function waitForPageReady(page, options = {}) {
 }
 
 async function dismissConsentDialogs(page) {
-  // Common consent/privacy dialog selectors (matches Swift WebView.swift patterns)
+  // Restrict this opt-in behavior to consent-manager controls. Broad dialog,
+  // modal, and aria-label selectors can close application UI unrelated to consent.
   const dismissSelectors = [
-    // OneTrust (very common)
-    '#onetrust-banner-sdk button#onetrust-accept-btn-handler',
-    '#onetrust-banner-sdk button#onetrust-reject-all-handler',
-    '#onetrust-close-btn-container button',
-    // Generic patterns
-    'button[data-test="cookie-accept-all"]',
-    'button[aria-label="Accept all"]',
-    'button[aria-label="Accept All"]',
-    'button[aria-label="Close"]',
-    'button[aria-label="Dismiss"]',
-    // Dialog close buttons
-    'dialog button:has-text("Close")',
-    'dialog button:has-text("Accept")',
-    'dialog button:has-text("I Accept")',
-    'dialog button:has-text("Got it")',
-    'dialog button:has-text("OK")',
-    // GDPR/CCPA specific
-    '[class*="consent"] button[class*="accept"]',
-    '[class*="consent"] button[class*="close"]',
-    '[class*="privacy"] button[class*="close"]',
-    '[class*="cookie"] button[class*="accept"]',
-    '[class*="cookie"] button[class*="close"]',
-    // Overlay close buttons
-    '[class*="modal"] button[class*="close"]',
-    '[class*="overlay"] button[class*="close"]',
+    '#onetrust-banner-sdk #onetrust-accept-btn-handler',
+    '#onetrust-banner-sdk #onetrust-reject-all-handler',
+    '#onetrust-banner-sdk #onetrust-close-btn-container button',
+    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+    '#CybotCookiebotDialogBodyButtonDecline',
+    '#qc-cmp2-ui button[mode="primary"]',
   ];
   
   for (const selector of dismissSelectors) {
@@ -3374,14 +3358,14 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
  */
 app.post('/tabs/:tabId/wait', async (req, res) => {
   try {
-    const { userId, timeout = 10000, waitForNetwork = true } = req.body;
+    const { userId, timeout = 10000, waitForNetwork = true, dismissConsent = false } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
     session.lastAccess = Date.now();
     
     const { tabState } = found;
-    const ready = await waitForPageReady(tabState.page, { timeout, waitForNetwork });
+    const ready = await waitForPageReady(tabState.page, { timeout, waitForNetwork, dismissConsent });
     
     res.json({ ok: true, ready });
   } catch (err) {
