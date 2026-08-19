@@ -1084,10 +1084,10 @@ async function launchBrowserInstance() {
 
     let localVirtualDisplay = null;
     let vdDisplay = undefined;
+    const useDesktopWindow = CONFIG.interactiveMode === 'desktop';
     let candidateBrowser = null;
-
     try {
-      if (os.platform() === 'linux') {
+      if (os.platform() === 'linux' && !useDesktopWindow) {
         localVirtualDisplay = pluginCtx.createVirtualDisplay();
         vdDisplay = await localVirtualDisplay.get();
         log('info', 'xvfb virtual display started', { display: vdDisplay, attempt });
@@ -1108,6 +1108,7 @@ async function launchBrowserInstance() {
       proxySession: launchProxy?.sessionId || null,
       proxyPoolSize: proxyPool?.size || 0,
       virtualDisplay: useVirtualDisplay,
+      interactiveMode: CONFIG.interactiveMode,
     });
 
     try {
@@ -1118,7 +1119,7 @@ async function launchBrowserInstance() {
       }
       const options = await launchOptions({
         executable_path: externalCamoufox?.executablePath,
-        headless: useVirtualDisplay ? false : true,
+        headless: useVirtualDisplay ? false : !useDesktopWindow,
         os: hostOS,
         humanize: true,
         enable_cache: true,
@@ -1177,6 +1178,7 @@ async function launchBrowserInstance() {
         attempt,
         maxAttempts,
         virtualDisplay: useVirtualDisplay,
+        interactiveMode: CONFIG.interactiveMode,
         proxyMode: proxyPool?.mode || null,
         proxyServer: launchProxy?.server || null,
         proxySession: launchProxy?.sessionId || null,
