@@ -48,4 +48,13 @@ describe('launch compatibility source contract', () => {
     expect(sessionContextOptions).toContain('viewport: null');
     expect(`${googleProbeOptions}\n${sessionContextOptions}`).not.toMatch(/viewport\s*:\s*\{\s*width\s*:/);
   });
+
+  test('health probe context also uses a null viewport', () => {
+    const healthProbeOptions = sourceBetween(
+      'testContext = await browser.newContext(',
+      'const page = await testContext.newPage();'
+    );
+
+    expect(healthProbeOptions).toContain('viewport: null');
+  });
 });
