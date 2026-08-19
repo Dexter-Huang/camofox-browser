@@ -223,8 +223,9 @@ Element refs are unambiguous and preferred over CSS selectors — a selector tha
 Two layers, covering different things:
 
 ```bash
-# 1. In-repository handshake + schema smoke test, then a packed-tarball
-#    install and handshake test. Neither needs a REST server.
+# 1. `test:mcp` installs the standalone adapter's locked dependencies, then
+#    runs the in-repository and packed-tarball handshake tests. Neither needs
+#    a REST server.
 npm run test:mcp
 
 # 2. Mock-HTTP contract tests — verifies the actual REST traffic each tool
