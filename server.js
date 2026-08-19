@@ -17,6 +17,7 @@ import {
   clearTabDownloads,
   clearSessionDownloads,
   attachDownloadListener,
+  clickWithDownloadGuard,
   getDownloadsList,
 } from './lib/downloads.js';
 import { extractPageImages } from './lib/images.js';
@@ -495,6 +496,7 @@ const HANDLER_TIMEOUT_MS = CONFIG.handlerTimeoutMs;
 const NEW_PAGE_TIMEOUT_MS = CONFIG.newPageTimeoutMs;
 const MAX_CONCURRENT_PER_USER = CONFIG.maxConcurrentPerUser;
 const PAGE_CLOSE_TIMEOUT_MS = 5000;
+const PAGE_FORCE_CLOSE_TIMEOUT_MS = 1000;
 const NAVIGATE_TIMEOUT_MS = CONFIG.navigateTimeoutMs;
 const BUILDREFS_TIMEOUT_MS = CONFIG.buildrefsTimeoutMs;
 const NATIVE_MEM_RESTART_THRESHOLD_MB = CONFIG.nativeMemRestartThresholdMb;
@@ -565,11 +567,17 @@ function getTabLock(tabId) {
 
 // Timeout is INSIDE the lock so each operation gets its full budget
 // regardless of how long it waited in the queue.
-async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS) {
+async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS, onTimeout) {
   const lock = getTabLock(tabId);
   await lock.acquire(TAB_LOCK_TIMEOUT_MS);
   try {
     return await withTimeout(operation(), timeoutMs, 'action');
+  } catch (err) {
+    if (onTimeout && isTimeoutError(err)) {
+      await onTimeout();
+      throw Object.assign(err, { code: 'tab_timeout', statusCode: 410 });
+    }
+    throw err;
   } finally {
     lock.release();
   }
@@ -631,7 +639,12 @@ async function safePageClose(page) {
     ]);
   } catch (e) {
     log('warn', 'page close timed out or failed, force-closing', { error: e.message });
-    try { await page.close({ runBeforeUnload: false }); } catch (_) {}
+    try {
+      await Promise.race([
+        page.close({ runBeforeUnload: false }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('page force-close timed out')), PAGE_FORCE_CLOSE_TIMEOUT_MS)),
+      ]);
+    } catch (_) {}
     page.removeAllListeners();
   }
 }
@@ -1480,7 +1493,7 @@ function handleRouteError(err, req, res, extraFields = {}) {
   // one poisoned page kills all subsequent navigations in that context. Destroy the
   // entire session so the next request gets a fresh BrowserContext + proxy.
   const NAVIGATION_TIMEOUT_ACTIONS = new Set(['click', 'navigate', 'open_url']);
-  if (isTimeoutError(err) && userId && NAVIGATION_TIMEOUT_ACTIONS.has(action)) {
+  if (isTimeoutError(err) && err.code !== 'tab_timeout' && userId && NAVIGATION_TIMEOUT_ACTIONS.has(action)) {
     log('warn', 'navigation timeout — destroying session for fresh proxy', {
       action, userId, error: err.message,
     });
@@ -1585,6 +1598,31 @@ function destroyTab(session, tabId, reason, userId) {
   return false;
 }
 
+async function destroyTimedOutTab(session, tabId, reason, userId) {
+  const found = session && findTab(session, tabId);
+  if (!found) return;
+  const { tabState, group, listItemId } = found;
+  log('warn', 'destroying timed-out tab', { tabId, listItemId, toolCalls: tabState.toolCalls, reason });
+  try {
+    await safePageClose(tabState.page);
+    await clearTabDownloads(tabState);
+  } catch (err) {
+    log('warn', 'timed-out tab cleanup failed', { tabId, error: err.message });
+  } finally {
+    group.delete(tabId);
+    if (group.size === 0) session.tabGroups.delete(listItemId);
+    const lock = tabLocks.get(tabId);
+    if (lock) {
+      lock.drain();
+      tabLocks.delete(tabId);
+      refreshTabLockQueueDepth();
+    }
+    refreshActiveTabsGauge();
+    tabsDestroyedTotal.labels(reason).inc();
+    pluginEvents.emit('tab:destroyed', { userId: userId || null, tabId, reason });
+  }
+}
+
 /**
  * Recycle the oldest (least-used) tab in a session to free a slot.
  * Closes the old tab's page and removes it from its group.
@@ -1668,6 +1706,7 @@ function createTabState(page) {
     refs: new Map(),
     visitedUrls: new Set(),
     downloads: [],
+    downloadEventSequence: 0,
     toolCalls: 0,
     consecutiveTimeouts: 0,
     consecutiveFailures: 0,
@@ -1899,10 +1938,10 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
     proxySession: session.proxySessionId || null,
   });
 
-  await withPageLoadDuration('navigate', () => page.goto('https://www.google.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }));
+  await withPageLoadDuration('navigate', () => navigatePage(page, 'https://www.google.com/'));
   tabState.visitedUrls.add('https://www.google.com/');
   await page.waitForTimeout(1200);
-  await withPageLoadDuration('navigate', () => page.goto(tabState.lastRequestedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+  await withPageLoadDuration('navigate', () => navigatePage(page, tabState.lastRequestedUrl));
   tabState.visitedUrls.add(tabState.lastRequestedUrl);
   return { session, tabState };
 }
@@ -1926,6 +1965,15 @@ async function withPageLoadDuration(action, fn) {
   } finally {
     end();
   }
+}
+
+async function navigatePage(page, url, { timeout = 30000 } = {}) {
+  const response = await page.goto(url, { waitUntil: 'commit', timeout });
+  const contentType = response?.headers()?.['content-type']?.toLowerCase() || '';
+  if (!contentType.startsWith('image/')) {
+    await page.waitForLoadState('domcontentloaded', { timeout });
+  }
+  return response;
 }
 
 
@@ -2828,7 +2876,7 @@ app.post('/tabs', async (req, res) => {
         if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
         tabState.lastRequestedUrl = url;
         try {
-          await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+          await withPageLoadDuration('open_url', () => navigatePage(page, url));
           recordNavSuccess(userId);
         } catch (navErr) {
           if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
@@ -2851,7 +2899,7 @@ app.post('/tabs', async (req, res) => {
             releasePageLease(session, retryLease);
             attachPopupHandler(retryPage, userId, resolvedSessionKey);
             refreshActiveTabsGauge();
-            await withPageLoadDuration('open_url', () => retryPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+            await withPageLoadDuration('open_url', () => navigatePage(retryPage, url));
             recordNavSuccess(userId);
           } else {
             if (recordNavFailure(userId)) {
@@ -2984,7 +3032,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
         const navigateCurrentPage = async () => {
           tabState.lastRequestedUrl = targetUrl;
           const ac = tabState.navigateAbort = new AbortController();
-          const gotoP = withPageLoadDuration('navigate', () => tabState.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+          const gotoP = withPageLoadDuration('navigate', () => navigatePage(tabState.page, targetUrl));
           try {
             await Promise.race([
               gotoP,
@@ -3005,7 +3053,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           const prewarm = await createLeasedPage(session);
           const prewarmPage = prewarm.page;
           try {
-            await withPageLoadDuration('navigate', () => prewarmPage.goto('https://www.google.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }));
+            await withPageLoadDuration('navigate', () => navigatePage(prewarmPage, 'https://www.google.com/'));
             tabState.visitedUrls.add('https://www.google.com/');
             await prewarmPage.waitForTimeout(1200);
           } finally {
@@ -3499,13 +3547,13 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         const y = box.y + box.height / 2;
         
         // Move mouse to element (triggers mouseover/mouseenter)
-        await tabState.page.mouse.move(x, y);
+        await withTimeout(tabState.page.mouse.move(x, y), Math.max(1, remainingBudget()), 'native mouse move');
         await tabState.page.waitForTimeout(50);
         
         // Full click sequence
-        await tabState.page.mouse.down();
+        await withTimeout(tabState.page.mouse.down(), Math.max(1, remainingBudget()), 'native mouse down');
         await tabState.page.waitForTimeout(50);
-        await tabState.page.mouse.up();
+        await withTimeout(tabState.page.mouse.up(), Math.max(1, remainingBudget()), 'native mouse up');
         
         log('info', 'mouse sequence dispatched', { x: x.toFixed(0), y: y.toFixed(0) });
       };
@@ -3516,10 +3564,11 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       
       const doClick = async (locatorOrSelector, isLocator) => {
         const locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector);
+        const click = async (options) => clickWithDownloadGuard(tabState, () => locator.click(options));
         
         if (onGoogleSerp) {
           try {
-            await locator.click({ timeout: 3000, force: true });
+            await click({ timeout: 3000, force: true });
           } catch (forceErr) {
             log('warn', 'google force click failed, trying mouse sequence');
             await dispatchMouseSequence(locator);
@@ -3529,13 +3578,13 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         
         try {
           // First try normal click (respects visibility, enabled, not-obscured)
-          await locator.click({ timeout: 3000 });
+          await click({ timeout: 3000 });
         } catch (err) {
           // Fallback 1: If intercepted by overlay, retry with force
           if (err.message.includes('intercepts pointer events')) {
             log('warn', 'click intercepted, retrying with force');
             try {
-              await locator.click({ timeout: 3000, force: true });
+              await click({ timeout: 3000, force: true });
             } catch (forceErr) {
               // Fallback 2: Full mouse event sequence for stubborn JS handlers
               log('warn', 'force click failed, trying mouse sequence');
@@ -3611,14 +3660,14 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       const newUrl = tabState.page.url();
       tabState.visitedUrls.add(newUrl);
       return { ok: true, url: newUrl, refsAvailable: tabState.refs.size > 0 };
-    }));
+    }, HANDLER_TIMEOUT_MS, () => destroyTimedOutTab(session, tabId, 'operation_timeout', userId)));
     
     log('info', 'clicked', { reqId: req.reqId, tabId, url: result.url });
     pluginEvents.emit('tab:click', { userId: req.body.userId, tabId, ref: req.body.ref, selector: req.body.selector });
     res.json(result);
   } catch (err) {
     log('error', 'click failed', { reqId: req.reqId, tabId, error: err.message });
-    if (err.message?.includes('timed out')) {
+    if (err.code !== 'tab_timeout' && err.message?.includes('timed out')) {
       try {
         const session = sessions.get(normalizeUserId(req.body.userId));
         const found = session && findTab(session, tabId);
@@ -4894,7 +4943,12 @@ app.post('/tabs/:tabId/evaluate', express.json({ limit: CONFIG.evaluateMaxBodySi
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
     pluginEvents.emit('tab:evaluate', { userId, tabId: req.params.tabId, expression });
-    const result = await tabState.page.evaluate(expression);
+    const result = await withUserLimit(userId, () => withTabLock(
+      req.params.tabId,
+      () => tabState.page.evaluate(expression),
+      requestTimeoutMs(),
+      () => destroyTimedOutTab(session, req.params.tabId, 'operation_timeout', userId),
+    ));
     pluginEvents.emit('tab:evaluated', { userId, tabId: req.params.tabId, result });
     log('info', 'evaluate', { reqId: req.reqId, tabId: req.params.tabId, userId, resultType: typeof result });
     res.json({ ok: true, result });
@@ -5809,7 +5863,7 @@ app.post('/tabs/open', async (req, res) => {
     refreshActiveTabsGauge();
     
     try {
-      await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+      await withPageLoadDuration('open_url', () => navigatePage(page, url));
       recordNavSuccess(userId);
     } catch (navErr) {
       if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
@@ -5831,7 +5885,7 @@ app.post('/tabs/open', async (req, res) => {
         releasePageLease(session, lease);
         attachPopupHandler(page, userId, listItemId);
         refreshActiveTabsGauge();
-        await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+        await withPageLoadDuration('open_url', () => navigatePage(page, url));
         recordNavSuccess(userId);
       } else {
         if (recordNavFailure(userId)) {
@@ -6004,7 +6058,7 @@ app.post('/navigate', async (req, res) => {
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(targetId, async () => {
-      await withPageLoadDuration('navigate', () => tabState.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+      await withPageLoadDuration('navigate', () => navigatePage(tabState.page, url));
       recordNavSuccess(userId);
       tabState.visitedUrls.add(url);
       tabState.lastSnapshot = null;

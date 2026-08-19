@@ -232,6 +232,10 @@ function createTestApp() {
     `);
   });
 
+  app.get('/bare-image', (req, res) => {
+    res.type('png').send(Buffer.from(samplePngBase64, 'base64'));
+  });
+
   // Page and endpoint for download capture tests
   app.get('/download-page', (req, res) => {
     res.send(`
