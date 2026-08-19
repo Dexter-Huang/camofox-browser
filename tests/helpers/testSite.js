@@ -48,6 +48,10 @@ function createTestApp() {
     `);
   });
 
+  app.get('/connection-reset', (req, res) => {
+    req.socket.destroy();
+  });
+
   // Page with multiple links for links extraction test
   app.get('/links', (req, res) => {
     res.send(`
