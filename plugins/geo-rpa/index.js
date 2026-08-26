@@ -472,6 +472,20 @@ export function register(app, ctx) {
         case 'enabled': result = await selected.isEnabled({ timeout: LOCATOR_TIMEOUT_MS }); break;
         case 'editable': result = await selected.isEditable({ timeout: LOCATOR_TIMEOUT_MS }); break;
         case 'inner_text': result = await selected.innerText({ timeout: LOCATOR_TIMEOUT_MS }); break;
+        case 'answer_markdown': result = await selected.evaluate((node) => {
+          // 固定在受控插件内的只读转换：只读取已选择的助手答案容器，不接收调用方脚本。
+          const text = (node.innerText || '').trim();
+          const seen = new Set();
+          const citations = [];
+          for (const link of node.querySelectorAll('a[href]')) {
+            let url;
+            try { url = new URL(link.getAttribute('href'), document.baseURI); } catch (_) { continue; }
+            if (!['http:', 'https:'].includes(url.protocol) || seen.has(url.href)) continue;
+            seen.add(url.href);
+            citations.push({ url: url.href, title: (link.innerText || link.getAttribute('title') || '').trim() });
+          }
+          return { markdown: text, citations };
+        }); break;
         case 'input_value': result = await selected.inputValue({ timeout: LOCATOR_TIMEOUT_MS }); break;
         case 'has_value_property': result = await selected.inputValue({ timeout: LOCATOR_TIMEOUT_MS }).then(() => true).catch(() => false); break;
         case 'content_editable': result = await selected.isEditable({ timeout: LOCATOR_TIMEOUT_MS }); break;
@@ -482,6 +496,14 @@ export function register(app, ctx) {
     } catch (error) {
       return res.status(400).json({ error: safeError(error) });
     }
+  });
+
+  // 仅返回当前受控 Tab 的自然地址，用于保存已提交会话的服务端定位信息；不接受导航参数。
+  app.get('/rpa/tabs/:tabId/current-url', async (req, res) => {
+    const userId = typeof req.query?.userId === 'string' ? req.query.userId : '';
+    const found = userId && findOwnedTab(sessions, userId, req.params.tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    return res.json({ url: found.tabState.page.url() });
   });
 
   app.post('/rpa/tabs/:tabId/locator-focus', body, async (req, res) => {
