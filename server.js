@@ -678,6 +678,9 @@ const BROWSER_IDLE_TIMEOUT_MS = CONFIG.browserIdleTimeoutMs;
 let browserIdleTimer = null;
 let browserLaunchPromise = null;
 let browserWarmRetryTimer = null;
+// 首次成功拉起 Firefox 后保持为真。正常空闲回收会按需重启浏览器，不应让
+// Docker 健康检查把一个已完成初始化的服务误判为不可用。
+let browserReady = false;
 
 // Tracks why the browser was last stopped. Intentional reasons (idle_shutdown, admin_stop)
 // keep /health returning 200. Unexpected reasons trigger 503 + warm retry.
@@ -1176,6 +1179,7 @@ async function launchBrowserInstance() {
       browserLaunchProxy = launchProxy;
       _lastBrowserPid = candidateBrowser.process?.()?.pid ?? null;
       browser = candidateBrowser; // publish AFTER PID is captured
+      browserReady = true;
       _lastBrowserStopReason = null; // clear — browser is healthy
       _lastBrowserRestartAt = Date.now();
       attachBrowserCleanup(browser, localVirtualDisplay);
@@ -2580,6 +2584,9 @@ async function refreshTabRefs(tabState, options = {}) {
  *                   type: boolean
  *                 browserRunning:
  *                   type: boolean
+ *                 browserReady:
+ *                   type: boolean
+ *                   description: Whether Firefox has completed at least one successful startup since this service process started.
  *                 activeTabs:
  *                   type: integer
  *                 activeSessions:
@@ -2633,6 +2640,7 @@ app.get('/health', (req, res) => {
     geoRpaProtocolVersion: 2,
     browserConnected: running,
     browserRunning: running,
+    browserReady,
     activeTabs: getTotalTabCount(),
     activeSessions: sessions.size,
     consecutiveFailures: Array.from(userNavHealth.values())

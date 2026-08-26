@@ -235,6 +235,10 @@
                     "browserRunning": {
                       "type": "boolean"
                     },
+                    "browserReady": {
+                      "type": "boolean",
+                      "description": "Whether Firefox has completed at least one successful startup since this service process started."
+                    },
                     "activeTabs": {
                       "type": "integer"
                     },

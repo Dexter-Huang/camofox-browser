@@ -160,6 +160,7 @@ describe('Security', () => {
       expect(data.sessions).toBeUndefined();
       expect(data.ok).toBe(true);
       expect(data.engine).toBe('camoufox');
+      expect(data.browserReady).toBe(true);
     });
 
     test('root does not expose session count', async () => {
