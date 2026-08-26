@@ -6,6 +6,7 @@ node_modules/
 # Logs
 logs/
 *.log
+*.err
 npm-debug.log*
 
 # Runtime

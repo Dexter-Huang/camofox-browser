@@ -38,7 +38,10 @@ PKGS=""
 for name in $PLUGIN_LIST; do
   f="$PLUGINS_DIR/$name/apt.txt"
   [ -f "$f" ] || continue
-  while IFS= read -r line; do
+  while IFS= read -r line || [ -n "$line" ]; do
+    # 插件目录允许在 Windows 维护；去掉 CRLF 的 \r，避免 apt 将
+    # "x11vnc\r" 视为不存在的包名并在后续 hook 中掩盖安装失败。
+    line=$(printf '%s' "$line" | tr -d '\r')
     case "$line" in \#*|"") continue ;; esac
     PKGS="$PKGS $line"
   done < "$f"
@@ -46,7 +49,9 @@ done
 
 if [ -n "$PKGS" ]; then
   echo "[install-plugin-deps] Installing:$PKGS"
-  apt-get update && apt-get install -y $PKGS && rm -rf /var/lib/apt/lists/*
+  apt-get update
+  apt-get install -y $PKGS
+  rm -rf /var/lib/apt/lists/*
 else
   echo "[install-plugin-deps] No apt dependencies"
 fi

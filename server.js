@@ -1129,6 +1129,13 @@ async function launchBrowserInstance() {
         exclude_addons: CONFIG.disableDefaultAddons ? ['UBO'] : undefined,
       });
       options.proxy = normalizePlaywrightProxy(options.proxy);
+      // Text-only RPA does not require voice/video capabilities. Disable WebRTC at
+      // browser launch so ICE gathering cannot reveal a network address outside the
+      // configured browser egress path.
+      options.firefoxUserPrefs = {
+        ...options.firefoxUserPrefs,
+        'media.peerconnection.enabled': false,
+      };
       // Playwright's launcher defaults handleSIGTERM/SIGINT/SIGHUP to true,
       // registering its own process signal handlers that send Browser.close
       // straight to Firefox over its debug transport the instant a signal
@@ -2620,6 +2627,10 @@ app.get('/health', (req, res) => {
   res.json({ 
     ok: true, 
     engine: 'camoufox',
+    // GEO RPA requires its restricted plugin endpoints. Keep this version on
+    // the normal health response so the Python adapter fails closed when an
+    // unmodified upstream image is deployed.
+    geoRpaProtocolVersion: 2,
     browserConnected: running,
     browserRunning: running,
     activeTabs: getTotalTabCount(),
