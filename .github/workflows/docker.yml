@@ -21,10 +21,10 @@ jobs:
       - name: Set image metadata
         id: image
         run: |
-          # Docker tag 不允许使用 ':'；以 UTC 生成时间并仅替换时间分隔符，
-          # 使 tag 合法且保持按时间排序。
+          # Docker tag 不允许使用 ':'；以北京时间生成并仅替换时间分隔符，
+          # 使 tag 合法且保持按时间排序。OCI 创建时间仍使用 UTC 标准格式。
           echo "name=ghcr.io/$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')/camofox-browser" >> "$GITHUB_OUTPUT"
-          echo "tag=$(date --utc '+%Y-%m-%d_%H-%M-%S')" >> "$GITHUB_OUTPUT"
+          echo "tag=$(TZ=Asia/Shanghai date '+%Y-%m-%d_%H-%M-%S')" >> "$GITHUB_OUTPUT"
           echo "created=$(date --utc --iso-8601=seconds)" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
