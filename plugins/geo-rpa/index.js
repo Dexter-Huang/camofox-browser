@@ -1,11 +1,19 @@
 import crypto from 'node:crypto';
 import express from 'express';
+import {
+  createManualWindowIdentity,
+  listTopLevelX11WindowIds,
+  openManualPopup,
+  waitForNewX11WindowId,
+} from './manual-window.js';
+import { readX11WindowTree } from './x11-window.js';
 
 // Fast read probes should fail quickly, but a real chat submission can take
 // longer while the page finishes its own event handlers. Keep the two budgets
 // separate so slow provider UI does not turn a dispatched native click into a
 // false task failure.
 const LOCATOR_TIMEOUT_MS = 3000;
+const LOCATOR_SCREENSHOT_TIMEOUT_MS = 15_000;
 const SUBMISSION_CLICK_TIMEOUT_MS = 12_000;
 const MAX_SELECTOR_LENGTH = 1024;
 const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
@@ -393,6 +401,96 @@ function removeTabCaptures(userId, tabId) {
 export function register(app, ctx) {
   const { sessions, log, safeError, events } = ctx;
   const body = express.json({ limit: '8kb' });
+  const manualWindows = new Map();
+  let browserDisplay = null;
+
+  events.on('browser:launched', ({ display }) => {
+    browserDisplay = typeof display === 'string' ? display : null;
+  });
+
+  async function closeManualWindow(handle) {
+    const manualWindow = manualWindows.get(handle);
+    if (!manualWindow) return false;
+    manualWindows.delete(handle);
+    await manualWindow.page.close().catch(() => {});
+    return true;
+  }
+
+  events.on('tab:destroyed', ({ userId, tabId }) => {
+    for (const [handle, manualWindow] of manualWindows) {
+      if (manualWindow.userId === String(userId) && manualWindow.tabId === tabId) {
+        void closeManualWindow(handle);
+      }
+    }
+  });
+
+  events.on('browser:closed', () => {
+    manualWindows.clear();
+    browserDisplay = null;
+  });
+
+  // This is deliberately an internal feasibility endpoint. It creates a fixed
+  // blank popup in the existing Context and returns only an opaque handle; it
+  // cannot enumerate X11 windows, execute caller-provided JavaScript, or move
+  // arbitrary tabs. The application layer must not consume it before the spike
+  // has shown that Firefox exposes a distinct top-level X11 window.
+  app.post('/rpa/tabs/:tabId/manual-window', body, async (req, res) => {
+    const userId = typeof req.body?.userId === 'string' ? req.body.userId : '';
+    const found = userId && findOwnedTab(sessions, userId, req.params.tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!browserDisplay) return res.status(409).json({ error: 'X11 display is unavailable' });
+    if ([...manualWindows.values()].some((entry) => entry.userId === userId && entry.tabId === req.params.tabId)) {
+      return res.status(409).json({ error: 'Manual window already exists for this tab' });
+    }
+
+    const identity = createManualWindowIdentity();
+    let popup = null;
+    try {
+      const existingWindowIds = new Set(
+        listTopLevelX11WindowIds(await readX11WindowTree(browserDisplay)),
+      );
+      popup = await openManualPopup(found.tabState.page, identity.title);
+      const windowId = await waitForNewX11WindowId({
+        display: browserDisplay,
+        existingWindowIds,
+        readWindowTree: readX11WindowTree,
+      });
+      const manualWindow = {
+        userId,
+        tabId: req.params.tabId,
+        page: popup,
+        state: 'window_ready',
+      };
+      manualWindows.set(identity.handle, manualWindow);
+      popup.once('close', () => { manualWindows.delete(identity.handle); });
+      // windowId is intentionally not stored or returned by this route. The
+      // next spike step will pass it only to an in-process window publisher.
+      void windowId;
+      return res.status(201).json({ handle: identity.handle, state: manualWindow.state });
+    } catch (error) {
+      await popup?.close().catch(() => {});
+      return res.status(409).json({ error: safeError(error) });
+    }
+  });
+
+  app.get('/rpa/manual-windows/:handle', async (req, res) => {
+    const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+    const manualWindow = manualWindows.get(req.params.handle);
+    if (!manualWindow || manualWindow.userId !== userId || manualWindow.page.isClosed()) {
+      return res.status(404).json({ error: 'Manual window not found' });
+    }
+    return res.json({ state: manualWindow.state });
+  });
+
+  app.delete('/rpa/manual-windows/:handle', body, async (req, res) => {
+    const userId = typeof req.body?.userId === 'string' ? req.body.userId : '';
+    const manualWindow = manualWindows.get(req.params.handle);
+    if (!manualWindow || manualWindow.userId !== userId) {
+      return res.status(404).json({ error: 'Manual window not found' });
+    }
+    await closeManualWindow(req.params.handle);
+    return res.status(204).end();
+  });
 
   events.on('tab:destroyed', ({ userId, tabId }) => {
     const normalizedUserId = String(userId);
@@ -549,6 +647,32 @@ export function register(app, ctx) {
   });
 
   // 仅返回当前受控 Tab 的自然地址，用于保存已提交会话的服务端定位信息；不接受导航参数。
+  // 回答截图只允许截取当前账号拥有的任务 Tab 内、由工作流声明的 CSS Locator。
+  // 不接受 text ref、坐标或页面脚本，避免该只读能力退化为任意页面内容导出接口。
+  app.post('/rpa/tabs/:tabId/locator-screenshot', body, async (req, res) => {
+    const userId = typeof req.body?.userId === 'string' ? req.body.userId : '';
+    const found = userId && findOwnedTab(sessions, userId, req.params.tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    const target = req.body?.target;
+    if (!target || typeof target !== 'object' || Array.isArray(target)
+      || !validSelector(target.selector) || target.text !== undefined) {
+      return res.status(400).json({ error: 'locator screenshot requires a CSS selector target' });
+    }
+    try {
+      const locator = await selectedLocator(found.tabState, target);
+      const buffer = await locator.screenshot({
+        type: 'png',
+        animations: 'disabled',
+        caret: 'hide',
+        timeout: LOCATOR_SCREENSHOT_TIMEOUT_MS,
+      });
+      res.set('Content-Type', 'image/png');
+      return res.send(buffer);
+    } catch (error) {
+      return res.status(400).json({ error: safeError(error) });
+    }
+  });
+
   app.get('/rpa/tabs/:tabId/current-url', async (req, res) => {
     const userId = typeof req.query?.userId === 'string' ? req.query.userId : '';
     const found = userId && findOwnedTab(sessions, userId, req.params.tabId);
