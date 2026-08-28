@@ -191,6 +191,14 @@ async function submitLocatorClick(locator) {
   });
 }
 
+function isSubmissionNotDispatched(error) {
+  // Playwright 明确报告遮罩层拦截指针事件时，正常 click 尚未送达目标控件。只有这一
+  // 可证明的动作前失败才允许主系统创建一次新任务；超时、连接断开和导航竞态都不能
+  // 推断为未提交，仍由提交确认与原会话恢复路径处理。
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('intercepts pointer events');
+}
+
 async function submitNearLocator(tabState, target) {
   const prompt = await selectedLocator(tabState, target);
   const promptBox = await prompt.boundingBox();
@@ -419,7 +427,10 @@ export function register(app, ctx) {
     // A reset is only valid after a terminal response. It must never cut off a
     // currently generating response merely because the caller observed a UI toast.
     if (capture.state !== 'complete' && capture.state !== 'failed') {
-      return res.status(409).json({ error: 'Network capture is still active' });
+      return res.status(409).json({
+        error: 'Network capture is still active',
+        code: 'network_capture_active',
+      });
     }
     capture.state = 'waiting';
     capture.status = null;
@@ -538,7 +549,13 @@ export function register(app, ctx) {
     const found = userId && findOwnedTab(sessions, userId, req.params.tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     try { await submitLocatorClick(await selectedLocator(found.tabState, req.body?.target)); return res.json({ ok: true }); }
-    catch (error) { return res.status(400).json({ error: safeError(error) }); }
+    catch (error) {
+      const message = safeError(error);
+      return res.status(400).json({
+        error: message,
+        ...(isSubmissionNotDispatched(error) ? { code: 'submission_not_dispatched' } : {}),
+      });
+    }
   });
 
   app.post('/rpa/tabs/:tabId/locator-submit', body, async (req, res) => {

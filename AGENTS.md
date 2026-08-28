@@ -419,13 +419,18 @@ novnc
 python3-websockify
 ```
 
-For binary downloads or setup not available via apt, add an executable `post-install.sh`:
+For binary setup not available via apt, add an executable `post-install.sh`. The YouTube plugin uses a
+pre-provisioned build artifact when available and only falls back to its upstream download for standalone installs:
 
 ```bash
 # plugins/youtube/post-install.sh
 #!/bin/sh
 set -e
-curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+if [ -f /app/bin/yt-dlp ]; then
+  cp /app/bin/yt-dlp /usr/local/bin/yt-dlp
+else
+  curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+fi
 chmod +x /usr/local/bin/yt-dlp
 ```
 
@@ -529,7 +534,7 @@ plugins/
     youtube.js      # yt-dlp process management + transcript parsing
     youtube.test.js # parser unit tests
     apt.txt         # python3-minimal (yt-dlp runtime dep)
-    post-install.sh # downloads yt-dlp binary
+    post-install.sh # uses pre-provisioned yt-dlp, with standalone-install fallback
 ```
 
 ```js
