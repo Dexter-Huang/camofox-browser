@@ -15,6 +15,7 @@ const mockWatcher = () => {
 const mockStartWatcher = jest.fn(mockWatcher);
 const mockResolveVncConfig = jest.fn((pluginConfig = {}) => ({
   enabled: pluginConfig.enabled || false,
+  publishDisplay: pluginConfig.publishDisplay !== false,
   resolution: pluginConfig.resolution
     ? (pluginConfig.resolution.split('x').length > 2 ? pluginConfig.resolution : `${pluginConfig.resolution}x24`)
     : '1920x1080x24',
@@ -85,6 +86,7 @@ describe('vnc plugin', () => {
     mockRemoveXvfbDisplayFiles.mockClear();
     mockResolveVncConfig.mockImplementation((pluginConfig = {}) => ({
       enabled: pluginConfig.enabled || false,
+      publishDisplay: pluginConfig.publishDisplay !== false,
       resolution: pluginConfig.resolution
         ? (pluginConfig.resolution.split('x').length > 2 ? pluginConfig.resolution : `${pluginConfig.resolution}x24`)
         : '1920x1080x24',
@@ -139,6 +141,21 @@ describe('vnc plugin', () => {
     const res = { json: jest.fn() };
     routes['GET /vnc/status'][0]({}, res);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ running: false }));
+  });
+
+  test('keeps high-resolution Xvfb without starting a whole-display watcher', async () => {
+    await register(mockApp, ctx, { enabled: true, publishDisplay: false, resolution: '1600x1000' });
+
+    expect(mockStartWatcher).not.toHaveBeenCalled();
+    const res = { json: jest.fn() };
+    routes['GET /vnc/status'][0]({}, res);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      running: false,
+      watcherRunning: false,
+    }));
+
+    const args = ctx.createVirtualDisplay().xvfb_args;
+    expect(args[args.indexOf('0') + 1]).toBe('1600x1000x24');
   });
 
   test('passes resolved config to startWatcher', async () => {

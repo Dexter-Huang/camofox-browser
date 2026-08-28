@@ -9,7 +9,17 @@ describe('vnc launcher config', () => {
     );
 
     expect(config.enabled).toBe(true);
+    expect(config.publishDisplay).toBe(true);
     expect(config.resolution).toBe('1280x720x24');
+  });
+
+  test('VNC_PUBLISH_DISPLAY disables the whole-display watcher', () => {
+    const config = resolveVncConfig(
+      { enabled: true, publishDisplay: true },
+      { VNC_PUBLISH_DISPLAY: '0' }
+    );
+
+    expect(config.publishDisplay).toBe(false);
   });
 
   test('buildWatcherEnv only includes watcher env whitelist', () => {
