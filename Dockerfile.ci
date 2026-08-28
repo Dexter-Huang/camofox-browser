@@ -83,7 +83,8 @@ COPY package.json package-lock.json ./
 COPY scripts/ ./scripts/
 # Build tools are needed when better-sqlite3 has no native prebuild for the target.
 # Trixie's glibc also supports the upstream arm64 prebuild at runtime.
-RUN npm ci --omit=dev \
+# 浏览器发行包已在上一步写入缓存；阻止 postinstall 再次访问外网下载它。
+RUN CAMOFOX_SKIP_DOWNLOAD=1 npm ci --omit=dev \
     && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/*
 
