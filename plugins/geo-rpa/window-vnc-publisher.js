@@ -111,8 +111,51 @@ export async function waitForRfbGreeting(port, { probe = rfbGreetingProbe, wait 
   throw new Error(`Window VNC publisher did not emit an RFB greeting on port ${port}`);
 }
 
-function stopProcess(process) {
-  if (process && process.exitCode === null && !process.killed) process.kill('SIGTERM');
+function processExited(process) {
+  return !process || process.exitCode !== null || process.signalCode !== null;
+}
+
+function waitForProcessExit(process, timeoutMs) {
+  if (processExited(process)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timeout);
+      process.removeListener('exit', finish);
+      process.removeListener('error', finish);
+      resolve(true);
+    };
+    const timeout = setTimeout(() => {
+      process.removeListener('exit', finish);
+      process.removeListener('error', finish);
+      resolve(false);
+    }, timeoutMs);
+    process.once('exit', finish);
+    process.once('error', finish);
+  });
+}
+
+/**
+ * x11vnc can keep serving an orphaned X11 window after SIGTERM in the
+ * container image. Wait for a graceful stop, then force the process down so
+ * the next manual session cannot attach to the stale fixed RFB port.
+ */
+export async function stopWindowVncProcess(
+  process,
+  { gracefulTimeoutMs = 500, forceTimeoutMs = 1000, wait = waitForProcessExit } = {},
+) {
+  if (processExited(process)) return;
+  try {
+    process.kill('SIGTERM');
+  } catch {
+    return;
+  }
+  if (await wait(process, gracefulTimeoutMs)) return;
+  try {
+    process.kill('SIGKILL');
+  } catch {
+    return;
+  }
+  await wait(process, forceTimeoutMs);
 }
 
 /**
@@ -151,16 +194,16 @@ export async function startWindowVncPublisher({
     await waitForTcpPort(websocketPort);
   } catch (error) {
     stopped = true;
-    stopProcess(websockify);
-    stopProcess(x11vnc);
+    await stopWindowVncProcess(websockify);
+    await stopWindowVncProcess(x11vnc);
     throw error;
   }
 
   return {
     async stop() {
       stopped = true;
-      stopProcess(websockify);
-      stopProcess(x11vnc);
+      await stopWindowVncProcess(websockify);
+      await stopWindowVncProcess(x11vnc);
     },
   };
 }

@@ -1,8 +1,10 @@
+import { EventEmitter } from 'node:events';
 import { describe, expect, jest, test } from '@jest/globals';
 import net from 'node:net';
 import {
   assertTcpPortAvailable,
   buildWindowPublisherCommands,
+  stopWindowVncProcess,
   waitForRfbGreeting,
   waitForTcpPort,
 } from './window-vnc-publisher.js';
@@ -46,5 +48,25 @@ describe('window VNC publisher', () => {
 
     await expect(assertTcpPortAvailable(address.port)).rejects.toThrow('already in use');
     await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  });
+
+  test('forces x11vnc down when it ignores the graceful termination signal', async () => {
+    const process = new EventEmitter();
+    process.exitCode = null;
+    process.signalCode = null;
+    process.kill = jest.fn((signal) => {
+      if (signal === 'SIGKILL') {
+        queueMicrotask(() => {
+          process.exitCode = 137;
+          process.emit('exit', 137, 'SIGKILL');
+        });
+      }
+      return true;
+    });
+
+    await stopWindowVncProcess(process, { gracefulTimeoutMs: 0, forceTimeoutMs: 10 });
+
+    expect(process.kill).toHaveBeenNthCalledWith(1, 'SIGTERM');
+    expect(process.kill).toHaveBeenNthCalledWith(2, 'SIGKILL');
   });
 });
