@@ -63,12 +63,52 @@ function tcpProbe(port) {
   });
 }
 
+function rfbGreetingProbe(port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    let received = Buffer.alloc(0);
+    const finish = (ready) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(ready);
+    };
+    socket.setTimeout(1000);
+    socket.once('connect', () => {});
+    socket.on('data', (chunk) => {
+      received = Buffer.concat([received, chunk]);
+      if (received.length >= 4) finish(received.subarray(0, 4).toString('ascii') === 'RFB ');
+    });
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+  });
+}
+
+/** Refuse stale listeners instead of treating another session's port as ready. */
+export function assertTcpPortAvailable(port) {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', () => reject(new Error(`Window VNC port ${port} is already in use`)));
+    server.listen({ host: '127.0.0.1', port, exclusive: true }, () => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  });
+}
+
 export async function waitForTcpPort(port, { probe = tcpProbe, wait = sleep } = {}) {
   for (let attempt = 0; attempt < READINESS_ATTEMPTS; attempt += 1) {
     if (await probe(port)) return;
     if (attempt + 1 < READINESS_ATTEMPTS) await wait(READINESS_DELAY_MS);
   }
   throw new Error(`Window VNC publisher did not listen on port ${port}`);
+}
+
+/** Verify that x11vnc owns a live X11 window and has started the RFB protocol. */
+export async function waitForRfbGreeting(port, { probe = rfbGreetingProbe, wait = sleep } = {}) {
+  for (let attempt = 0; attempt < READINESS_ATTEMPTS; attempt += 1) {
+    if (await probe(port)) return;
+    if (attempt + 1 < READINESS_ATTEMPTS) await wait(READINESS_DELAY_MS);
+  }
+  throw new Error(`Window VNC publisher did not emit an RFB greeting on port ${port}`);
 }
 
 function stopProcess(process) {
@@ -89,6 +129,10 @@ export async function startWindowVncPublisher({
   onExit = () => {},
 }) {
   const commands = buildWindowPublisherCommands({ display, windowId, rfbPort, websocketPort });
+  // A previous publisher must never be silently reused: its X11 window may
+  // already be gone, which leaves the browser WebSocket connected but idle.
+  await assertTcpPortAvailable(rfbPort);
+  await assertTcpPortAvailable(websocketPort);
   const x11vnc = spawn('x11vnc', commands.x11vnc, { stdio: 'ignore' });
   let websockify = null;
   let stopped = false;
@@ -100,6 +144,7 @@ export async function startWindowVncPublisher({
 
   try {
     await waitForTcpPort(rfbPort);
+    await waitForRfbGreeting(rfbPort);
     websockify = spawn('websockify', commands.websockify, { stdio: 'ignore' });
     websockify.once('exit', () => notifyExit('websockify'));
     websockify.once('error', () => notifyExit('websockify'));

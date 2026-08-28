@@ -425,6 +425,18 @@ export function register(app, ctx, pluginConfig = {}) {
     return true;
   }
 
+  /**
+   * Context deletion bypasses the per-tab destroy event. Revoke every
+   * publisher first, while the popup page is still valid, so its fixed ports
+   * cannot survive into the next manual lease.
+   */
+  async function closeManualWindowsForUser(userId) {
+    const handles = [...manualWindows.entries()]
+      .filter(([, manualWindow]) => manualWindow.userId === String(userId))
+      .map(([handle]) => handle);
+    await Promise.all(handles.map((handle) => closeManualWindow(handle)));
+  }
+
   function findManagedTabId(session, page) {
     for (const group of session.tabGroups.values()) {
       for (const [tabId, tabState] of group) {
@@ -451,7 +463,14 @@ export function register(app, ctx, pluginConfig = {}) {
     }
   });
 
+  events.on('session:destroying', async ({ userId }) => {
+    await closeManualWindowsForUser(userId);
+  });
+
   events.on('browser:closed', () => {
+    for (const manualWindow of manualWindows.values()) {
+      void manualWindow.publisher?.stop().catch(() => {});
+    }
     manualWindows.clear();
     browserDisplay = null;
   });

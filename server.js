@@ -5181,6 +5181,9 @@ app.delete('/tabs/:tabId', async (req, res) => {
         session.tabGroups.delete(found.listItemId);
       }
       refreshActiveTabsGauge();
+      pluginEvents.emit('tab:destroyed', {
+        userId: normalizeUserId(userId), tabId: req.params.tabId, reason: 'api_delete',
+      });
       log('info', 'tab closed', { reqId: req.reqId, tabId: req.params.tabId, userId });
     }
     res.json({ ok: true });

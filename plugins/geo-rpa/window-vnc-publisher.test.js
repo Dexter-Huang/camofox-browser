@@ -1,5 +1,11 @@
 import { describe, expect, jest, test } from '@jest/globals';
-import { buildWindowPublisherCommands, waitForTcpPort } from './window-vnc-publisher.js';
+import net from 'node:net';
+import {
+  assertTcpPortAvailable,
+  buildWindowPublisherCommands,
+  waitForRfbGreeting,
+  waitForTcpPort,
+} from './window-vnc-publisher.js';
 
 describe('window VNC publisher', () => {
   test('binds x11vnc to exactly one display and one native window', () => {
@@ -23,5 +29,22 @@ describe('window VNC publisher', () => {
 
     await expect(waitForTcpPort(6081, { probe, wait })).resolves.toBeUndefined();
     expect(wait).toHaveBeenCalledTimes(1);
+  });
+
+  test('requires an RFB greeting instead of accepting a listening stale publisher', async () => {
+    const probe = jest.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const wait = jest.fn(async () => undefined);
+
+    await expect(waitForRfbGreeting(5901, { probe, wait })).resolves.toBeUndefined();
+    expect(wait).toHaveBeenCalledTimes(1);
+  });
+
+  test('rejects an already occupied fixed publisher port', async () => {
+    const server = net.createServer();
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+
+    await expect(assertTcpPortAvailable(address.port)).rejects.toThrow('already in use');
+    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   });
 });
