@@ -13,6 +13,8 @@ const MAX_CAPTURES_PER_TAB = 2;
 const MAX_MANUAL_TEXT_LENGTH = 10_000;
 const MAX_MANUAL_COORDINATE = 10_000;
 const MAX_MANUAL_WHEEL_DELTA = 10_000;
+const VIEWPORT_READY_ATTEMPTS = 10;
+const VIEWPORT_READY_RETRY_DELAY_MS = 150;
 const MANUAL_MOUSE_TYPES = new Set(['move', 'down', 'up', 'wheel']);
 const MANUAL_BUTTONS = new Set(['left', 'middle', 'right']);
 const MANUAL_MODIFIERS = new Set(['Alt', 'Control', 'Meta', 'Shift']);
@@ -40,6 +42,55 @@ function findOwnedTab(sessions, userId, tabId) {
     if (tabState) return { session, tabState };
   }
   return null;
+}
+
+function validViewport(viewport) {
+  return viewport
+    && Number.isInteger(viewport.width)
+    && Number.isInteger(viewport.height)
+    && viewport.width > 0
+    && viewport.height > 0;
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+export async function readReadyViewport(page, wait = sleep) {
+  let lastError = null;
+  for (let attempt = 0; attempt < VIEWPORT_READY_ATTEMPTS; attempt += 1) {
+    try {
+      const configuredViewport = page.viewportSize();
+      if (validViewport(configuredViewport)) return configuredViewport;
+
+      // Camoufox 的 viewport:null Context 不会暴露 Playwright viewportSize。
+      // 在虚拟显示器中 html 的布局框也可能恒为空，但已加载页面的 body 仍处于同一
+      // CSS 坐标系。二者均不可用时才等待，不能使用截图像素尺寸替代鼠标输入坐标。
+      for (const rootSelector of ['html', 'body']) {
+        const rootBox = await page.locator(rootSelector).boundingBox();
+        const viewport = rootBox && {
+          width: Math.round(rootBox.width),
+          height: Math.round(rootBox.height),
+        };
+        if (validViewport(viewport)) return viewport;
+      }
+      // 某些 Camoufox 指纹配置会令根元素的 Playwright boundingBox 恒为空，
+      // 但页面窗口本身仍正常接收截图和原生鼠标事件。此处的表达式固定在服务端，
+      // 不接收调用方脚本或页面内容，只读取 page.mouse 使用的 CSS 视口坐标。
+      const windowViewport = await page.locator('body').evaluate((node) => {
+        const view = node.ownerDocument.defaultView;
+        return { width: view?.innerWidth, height: view?.innerHeight };
+      });
+      if (validViewport(windowViewport)) return windowViewport;
+      lastError = new Error('Tab viewport is unavailable');
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt + 1 < VIEWPORT_READY_ATTEMPTS) {
+      await wait(VIEWPORT_READY_RETRY_DELAY_MS);
+    }
+  }
+  throw lastError || new Error('Tab viewport is unavailable');
 }
 
 function validSelector(value) {
@@ -373,19 +424,7 @@ export function register(app, ctx) {
     const found = userId && findOwnedTab(sessions, userId, req.params.tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     try {
-      let viewport = found.tabState.page.viewportSize();
-      if (!viewport) {
-        // Camoufox contexts configured from a screen size may not expose
-        // Playwright's viewportSize. The root box still yields the CSS width;
-        // the client uses that uniform device scale for both input axes.
-        const rootBox = await found.tabState.page.locator('html').boundingBox();
-        if (!rootBox) throw new Error('Tab viewport is unavailable');
-        viewport = { width: Math.round(rootBox.width), height: Math.round(rootBox.height) };
-      }
-      if (!Number.isInteger(viewport.width) || !Number.isInteger(viewport.height)
-        || viewport.width <= 0 || viewport.height <= 0) {
-        throw new Error('Tab viewport is unavailable');
-      }
+      const viewport = await readReadyViewport(found.tabState.page);
       return res.json({ ok: true, width: viewport.width, height: viewport.height });
     } catch (error) {
       return res.status(409).json({ error: safeError(error) });
