@@ -60,14 +60,20 @@ describe('manual X11 window helpers', () => {
     const popup = {
       waitForLoadState: jest.fn(async () => undefined),
       evaluate: jest.fn(async () => undefined),
+      goto: jest.fn(async () => undefined),
     };
     const page = {
       waitForEvent: jest.fn(async () => popup),
       evaluate: jest.fn(async () => true),
     };
 
-    await expect(openManualPopup(page, 'GEO_MANUAL_WINDOW_test')).resolves.toBe(popup);
+    await expect(openManualPopup(
+      page, 'GEO_MANUAL_WINDOW_test', 'https://example.com/',
+    )).resolves.toBe(popup);
     expect(page.waitForEvent).toHaveBeenCalledWith('popup', { timeout: 5000 });
     expect(popup.evaluate).toHaveBeenCalledWith(expect.any(Function), 'GEO_MANUAL_WINDOW_test');
+    expect(popup.goto).toHaveBeenCalledWith('https://example.com/', {
+      waitUntil: 'domcontentloaded', timeout: 90_000,
+    });
   });
 });

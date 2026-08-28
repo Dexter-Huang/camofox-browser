@@ -7,6 +7,7 @@ import {
   waitForNewX11WindowId,
 } from './manual-window.js';
 import { readX11WindowTree } from './x11-window.js';
+import { startWindowVncPublisher } from './window-vnc-publisher.js';
 
 // Fast read probes should fail quickly, but a real chat submission can take
 // longer while the page finishes its own event handlers. Keep the two budgets
@@ -398,11 +399,18 @@ function removeTabCaptures(userId, tabId) {
 }
 
 /** Register GEO's account-scoped, no-script RPA transport. */
-export function register(app, ctx) {
+export function register(app, ctx, pluginConfig = {}) {
   const { sessions, log, safeError, events } = ctx;
   const body = express.json({ limit: '8kb' });
   const manualWindows = new Map();
   let browserDisplay = null;
+  // 首期只允许一个人工租约，因此使用固定的容器回环端口即可。端口不透出
+  // Camofox HTTP 响应；后续业务接入只能通过 FastAPI 的同源 WebSocket 代理。
+  const manualWindowVnc = {
+    enabled: pluginConfig.manualWindowVnc?.enabled === true,
+    rfbPort: Number(pluginConfig.manualWindowVnc?.rfbPort || 5901),
+    websocketPort: Number(pluginConfig.manualWindowVnc?.websocketPort || 6081),
+  };
 
   events.on('browser:launched', ({ display }) => {
     browserDisplay = typeof display === 'string' ? display : null;
@@ -412,8 +420,27 @@ export function register(app, ctx) {
     const manualWindow = manualWindows.get(handle);
     if (!manualWindow) return false;
     manualWindows.delete(handle);
+    await manualWindow.publisher?.stop().catch(() => {});
     await manualWindow.page.close().catch(() => {});
     return true;
+  }
+
+  function findManagedTabId(session, page) {
+    for (const group of session.tabGroups.values()) {
+      for (const [tabId, tabState] of group) {
+        if (tabState.page === page) return tabId;
+      }
+    }
+    return null;
+  }
+
+  async function waitForManagedTabId(session, page) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const tabId = findManagedTabId(session, page);
+      if (tabId) return tabId;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error('Manual popup was not registered as a managed tab');
   }
 
   events.on('tab:destroyed', ({ userId, tabId }) => {
@@ -439,7 +466,8 @@ export function register(app, ctx) {
     const found = userId && findOwnedTab(sessions, userId, req.params.tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     if (!browserDisplay) return res.status(409).json({ error: 'X11 display is unavailable' });
-    if ([...manualWindows.values()].some((entry) => entry.userId === userId && entry.tabId === req.params.tabId)) {
+    if ([...manualWindows.values()].some((entry) => entry.userId === userId
+      && (entry.tabId === req.params.tabId || entry.sourceTabId === req.params.tabId))) {
       return res.status(409).json({ error: 'Manual window already exists for this tab' });
     }
 
@@ -449,7 +477,8 @@ export function register(app, ctx) {
       const existingWindowIds = new Set(
         listTopLevelX11WindowIds(await readX11WindowTree(browserDisplay)),
       );
-      popup = await openManualPopup(found.tabState.page, identity.title);
+      popup = await openManualPopup(found.tabState.page, identity.title, found.tabState.page.url());
+      const popupTabId = await waitForManagedTabId(found.session, popup);
       const windowId = await waitForNewX11WindowId({
         display: browserDisplay,
         existingWindowIds,
@@ -457,16 +486,40 @@ export function register(app, ctx) {
       });
       const manualWindow = {
         userId,
-        tabId: req.params.tabId,
+        tabId: popupTabId,
+        sourceTabId: req.params.tabId,
         page: popup,
         state: 'window_ready',
+        publisher: null,
       };
       manualWindows.set(identity.handle, manualWindow);
-      popup.once('close', () => { manualWindows.delete(identity.handle); });
-      // windowId is intentionally not stored or returned by this route. The
-      // next spike step will pass it only to an in-process window publisher.
-      void windowId;
-      return res.status(201).json({ handle: identity.handle, state: manualWindow.state });
+      popup.once('close', () => {
+        const activeWindow = manualWindows.get(identity.handle);
+        if (activeWindow !== manualWindow) return;
+        manualWindows.delete(identity.handle);
+        void activeWindow.publisher?.stop().catch(() => {});
+      });
+      if (manualWindowVnc.enabled) {
+        manualWindow.publisher = await startWindowVncPublisher({
+          display: browserDisplay,
+          windowId,
+          rfbPort: manualWindowVnc.rfbPort,
+          websocketPort: manualWindowVnc.websocketPort,
+          onExit: () => {
+            manualWindow.state = 'failed';
+            void closeManualWindow(identity.handle);
+          },
+        });
+        manualWindow.state = 'published';
+      }
+      // windowId is intentionally neither stored nor returned by this route.
+      // targetId is an account-scoped Camofox tab id consumed only by FastAPI
+      // for health checks and cleanup. It is never forwarded to the browser.
+      return res.status(201).json({
+        handle: identity.handle,
+        state: manualWindow.state,
+        targetId: popupTabId,
+      });
     } catch (error) {
       await popup?.close().catch(() => {});
       return res.status(409).json({ error: safeError(error) });
@@ -646,7 +699,6 @@ export function register(app, ctx) {
     }
   });
 
-  // 仅返回当前受控 Tab 的自然地址，用于保存已提交会话的服务端定位信息；不接受导航参数。
   // 回答截图只允许截取当前账号拥有的任务 Tab 内、由工作流声明的 CSS Locator。
   // 不接受 text ref、坐标或页面脚本，避免该只读能力退化为任意页面内容导出接口。
   app.post('/rpa/tabs/:tabId/locator-screenshot', body, async (req, res) => {
@@ -660,10 +712,16 @@ export function register(app, ctx) {
     }
     try {
       const locator = await selectedLocator(found.tabState, target);
-      const buffer = await locator.screenshot({
+      // Locator.screenshot() 会在目标离开视口时自动滚动，并且 animations/caret
+      // 选项会临时改写页面渲染状态。回答完成后的取证不能制造这些可观察行为，
+      // 因此只读取元素已有的布局框，再由浏览器截图接口按该矩形裁剪。
+      const clip = await locator.boundingBox({ timeout: LOCATOR_TIMEOUT_MS });
+      if (!clip || clip.width <= 0 || clip.height <= 0) {
+        throw new Error('answer locator has no visible bounds');
+      }
+      const buffer = await found.tabState.page.screenshot({
         type: 'png',
-        animations: 'disabled',
-        caret: 'hide',
+        clip,
         timeout: LOCATOR_SCREENSHOT_TIMEOUT_MS,
       });
       res.set('Content-Type', 'image/png');
@@ -673,6 +731,7 @@ export function register(app, ctx) {
     }
   });
 
+  // 仅返回当前受控 Tab 的自然地址，用于保存已提交会话的服务端定位信息；不接受导航参数。
   app.get('/rpa/tabs/:tabId/current-url', async (req, res) => {
     const userId = typeof req.query?.userId === 'string' ? req.query.userId : '';
     const found = userId && findOwnedTab(sessions, userId, req.params.tabId);

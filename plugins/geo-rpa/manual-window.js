@@ -104,7 +104,7 @@ export async function waitForNewX11WindowId({
  * script-evaluation surface. It is a feasibility probe only: the source tab
  * remains intact until a later protocol can safely transfer ownership.
  */
-export async function openManualPopup(page, title) {
+export async function openManualPopup(page, title, targetUrl) {
   const popupPromise = page.waitForEvent('popup', { timeout: POPUP_TIMEOUT_MS });
   const opened = await page.evaluate(() => {
     const popup = window.open('about:blank', '_blank', 'popup=yes,width=1440,height=900');
@@ -116,5 +116,11 @@ export async function openManualPopup(page, title) {
   const popup = await popupPromise;
   await popup.waitForLoadState('domcontentloaded').catch(() => {});
   await popup.evaluate((popupTitle) => { document.title = popupTitle; }, title);
+  // The source page already resolved the provider's entry URL in this account
+  // Context. Navigate the popup to that final URL so the visible window owns
+  // the real manual page while retaining the same persistent profile state.
+  if (typeof targetUrl === 'string' && targetUrl) {
+    await popup.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 90_000 });
+  }
   return popup;
 }

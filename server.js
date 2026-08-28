@@ -2637,7 +2637,7 @@ app.get('/health', (req, res) => {
     // GEO RPA requires its restricted plugin endpoints. Keep this version on
     // the normal health response so the Python adapter fails closed when an
     // unmodified upstream image is deployed.
-    geoRpaProtocolVersion: 2,
+    geoRpaProtocolVersion: 3,
     browserConnected: running,
     browserRunning: running,
     browserReady,
