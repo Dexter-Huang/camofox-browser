@@ -3,9 +3,36 @@ import crypto from 'node:crypto';
 const WINDOW_DISCOVERY_ATTEMPTS = 20;
 const WINDOW_DISCOVERY_DELAY_MS = 150;
 const POPUP_TIMEOUT_MS = 5000;
+const TASK_WINDOW_POPUP_FEATURES = 'popup=yes,width=1440,height=900';
+export const MANUAL_WINDOW_POPUP_FEATURES = 'popup=yes,width=1920,height=1009';
+const MANUAL_WINDOW_OUTER_SIZE = { width: 1920, height: 1080 };
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function detachedSleep(milliseconds) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds);
+    timer.unref?.();
+  });
+}
+
+/**
+ * Keep a headed popup at the VNC geometry without delaying publisher startup.
+ *
+ * Provider pages can resize their native Firefox window several seconds after
+ * navigation commit. A short one-shot retry finishes too early and leaves a
+ * gray edge in the captured VNC framebuffer, so keep this lightweight repair
+ * active through the provider's first layout phase.
+ */
+async function stabilizeManualPopup(popup) {
+  await detachedSleep(250);
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    if (popup.isClosed()) return;
+    await popup.evaluate(({ width, height }) => window.resizeTo(width, height), MANUAL_WINDOW_OUTER_SIZE);
+    await detachedSleep(100);
+  }
 }
 
 /** Return an opaque handle and a title marker controlled entirely by the fork. */
@@ -100,27 +127,47 @@ export async function waitForNewX11WindowId({
 
 /**
  * Open a native popup using a fixed page script. The caller supplies no page
- * JavaScript, URL, title, or feature string, so this cannot become a generic
- * script-evaluation surface. It is a feasibility probe only: the source tab
- * remains intact until a later protocol can safely transfer ownership.
+ * JavaScript, URL, title, or raw feature string, so this cannot become a
+ * generic script-evaluation surface. Manual control may select the wider
+ * fixed geometry; task windows retain their existing footprint.
  */
-export async function openManualPopup(page, title, targetUrl) {
+export async function openManualPopup(page, title, targetUrl, { manualWindow = false } = {}) {
   const popupPromise = page.waitForEvent('popup', { timeout: POPUP_TIMEOUT_MS });
-  const opened = await page.evaluate(() => {
-    const popup = window.open('about:blank', '_blank', 'popup=yes,width=1440,height=900');
+  const popupFeatures = manualWindow ? MANUAL_WINDOW_POPUP_FEATURES : TASK_WINDOW_POPUP_FEATURES;
+  const opened = await page.evaluate((features) => {
+    const popup = window.open('about:blank', '_blank', features);
     if (!popup) return false;
     return true;
-  });
+  }, popupFeatures);
   if (!opened) throw new Error('Firefox blocked the manual popup window');
 
   const popup = await popupPromise;
   await popup.waitForLoadState('domcontentloaded').catch(() => {});
+  if (manualWindow) {
+    // Headed Firefox owns native window geometry. Let the script-opened
+    // window fill the Xvfb directly instead of combining it with Playwright's
+    // viewport emulation, which can leave an unpainted right edge.
+    await popup.evaluate(({ width, height }) => window.resizeTo(width, height), MANUAL_WINDOW_OUTER_SIZE);
+  }
   await popup.evaluate((popupTitle) => { document.title = popupTitle; }, title);
   // The source page already resolved the provider's entry URL in this account
   // Context. Navigate the popup to that final URL so the visible window owns
   // the real manual page while retaining the same persistent profile state.
   if (typeof targetUrl === 'string' && targetUrl) {
-    await popup.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 90_000 });
+    // 页面提交后即可启动窗口级 VNC；无需阻塞到 DOM 完整加载，后续加载过程会自然呈现。
+    await popup.goto(targetUrl, { waitUntil: 'commit', timeout: 90_000 });
+    if (manualWindow) {
+      // Navigation can restore the opener's native geometry in headed mode;
+      // re-apply the fixed outer size after commit before the VNC publisher starts.
+      await popup.evaluate(({ width, height }) => window.resizeTo(width, height), MANUAL_WINDOW_OUTER_SIZE);
+      // Give the compositor one frame to repaint before x11vnc starts publishing
+      // the resized native window.
+      await popup.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => resolve())));
+      // The publisher can start after the first synchronized geometry. Keep
+      // correcting late provider-driven native resizes asynchronously so this
+      // work does not delay the manual-session HTTP response.
+      void stabilizeManualPopup(popup).catch(() => {});
+    }
   }
   return popup;
 }

@@ -1,5 +1,6 @@
 import { describe, expect, jest, test } from '@jest/globals';
 import {
+  MANUAL_WINDOW_POPUP_FEATURES,
   createManualWindowIdentity,
   findX11WindowId,
   openManualPopup,
@@ -68,12 +69,20 @@ describe('manual X11 window helpers', () => {
     };
 
     await expect(openManualPopup(
-      page, 'GEO_MANUAL_WINDOW_test', 'https://example.com/',
+      page,
+      'GEO_MANUAL_WINDOW_test',
+      'https://example.com/',
+      { manualWindow: true },
     )).resolves.toBe(popup);
     expect(page.waitForEvent).toHaveBeenCalledWith('popup', { timeout: 5000 });
+    expect(page.evaluate).toHaveBeenCalledWith(expect.any(Function), MANUAL_WINDOW_POPUP_FEATURES);
     expect(popup.evaluate).toHaveBeenCalledWith(expect.any(Function), 'GEO_MANUAL_WINDOW_test');
     expect(popup.goto).toHaveBeenCalledWith('https://example.com/', {
-      waitUntil: 'domcontentloaded', timeout: 90_000,
+      waitUntil: 'commit', timeout: 90_000,
     });
+  });
+
+  test('uses the virtual display size for manual control', () => {
+    expect(MANUAL_WINDOW_POPUP_FEATURES).toBe('popup=yes,width=1920,height=1009');
   });
 });

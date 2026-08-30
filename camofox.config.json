@@ -7,7 +7,7 @@
   "plugins": {
     "youtube": { "enabled": true },
     "persistence": { "enabled": true },
-    "vnc": { "enabled": true, "resolution": "1600x1000", "publishDisplay": false },
+    "vnc": { "enabled": true, "resolution": "1920x1080", "publishDisplay": false },
     "geo-rpa": {
       "enabled": true,
       "manualWindowVnc": {

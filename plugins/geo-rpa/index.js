@@ -662,6 +662,7 @@ export function register(app, ctx, pluginConfig = {}) {
         found.tabState.page,
         identity.title,
         found.tabState.page.url(),
+        { manualWindow: true },
       );
       const popupTabId = await waitForManagedTabId(found.session, popup);
       const windowId = await waitForNewX11WindowId({
