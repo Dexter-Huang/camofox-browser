@@ -61,6 +61,27 @@ export async function register(app, ctx, pluginConfig = {}) {
   const indexedDB = pluginConfig.indexedDB === true;
   ctx.persistenceStorageStateOptions = indexedDB ? { indexedDB: true } : undefined;
 
+  // Fail readiness before accepting RPA work when the mounted profile volume
+  // cannot be written by the node service user.
+  let persistenceReady = true;
+  let persistenceError = null;
+  try {
+    await fs.mkdir(profileDir, { recursive: true });
+    await fs.access(profileDir, fs.constants.W_OK);
+    const probePath = `${profileDir}/.write-probe-${process.pid}`;
+    await fs.writeFile(probePath, 'ok');
+    await fs.unlink(probePath);
+  } catch (err) {
+    persistenceReady = false;
+    persistenceError = err?.code || 'write_failed';
+    log('error', 'persistence profile directory is not writable', {
+      profileDir,
+      error: err?.message || String(err),
+    });
+  }
+  config.persistenceReady = persistenceReady;
+  config.persistenceError = persistenceError;
+
   const logger = {
     warn: (msg, fields = {}) => log('warn', msg, fields),
   };

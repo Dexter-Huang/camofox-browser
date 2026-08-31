@@ -3287,6 +3287,12 @@ async function refreshTabRefs(tabState, options = {}) {
  *                   type: integer
  *                 consecutiveFailures:
  *                   type: integer
+ *                 persistenceReady:
+ *                   type: boolean
+ *                   description: Whether the persistent profile directory is writable by the service user.
+ *                 persistenceError:
+ *                   type: string
+ *                   nullable: true
  *       503:
  *         description: Unhealthy or recovering.
  *         content:
@@ -3310,6 +3316,22 @@ app.get("/health", (req, res) => {
   const rssMb = Math.round(mem.rss / 1048576);
   const heapUsedMb = Math.round(mem.heapUsed / 1048576);
   const nativeMemMb = rssMb - heapUsedMb;
+
+  if (CONFIG.persistenceReady === false) {
+    return res.status(503).json({
+      ok: false,
+      engine: "camoufox",
+      geoRpaProtocolVersion: 3,
+      browserRunning: running,
+      browserReady,
+      persistenceReady: false,
+      persistenceError: CONFIG.persistenceError || "write_failed",
+      reason: "persistence_unavailable",
+      activeTabs: getTotalTabCount(),
+      activeSessions: sessions.size,
+      memory: { rssMb, heapUsedMb, nativeMemMb },
+    });
+  }
 
   // Browser not running: distinguish intentional idle stop from unexpected death
   if (
@@ -3347,6 +3369,9 @@ app.get("/health", (req, res) => {
       (sum, h) => sum + h.consecutiveNavFailures,
       0,
     ),
+    ...(typeof CONFIG.persistenceReady === "boolean"
+      ? { persistenceReady: CONFIG.persistenceReady, persistenceError: CONFIG.persistenceError }
+      : {}),
     memory: { rssMb, heapUsedMb, nativeMemMb },
     ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
   });

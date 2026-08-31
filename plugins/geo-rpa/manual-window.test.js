@@ -1,6 +1,7 @@
 import { describe, expect, jest, test } from '@jest/globals';
 import {
   MANUAL_WINDOW_POPUP_FEATURES,
+  MANUAL_PAGE_VIEWPORT_SIZE,
   createManualWindowIdentity,
   findX11WindowId,
   openManualPopup,
@@ -60,6 +61,8 @@ describe('manual X11 window helpers', () => {
   test('opens a fixed popup and assigns the controlled title', async () => {
     const popup = {
       waitForLoadState: jest.fn(async () => undefined),
+      viewportSize: jest.fn(() => MANUAL_PAGE_VIEWPORT_SIZE),
+      setViewportSize: jest.fn(async () => undefined),
       evaluate: jest.fn(async () => undefined),
       goto: jest.fn(async () => undefined),
     };
@@ -80,6 +83,7 @@ describe('manual X11 window helpers', () => {
     expect(popup.goto).toHaveBeenCalledWith('https://example.com/', {
       waitUntil: 'commit', timeout: 90_000,
     });
+    expect(popup.setViewportSize).toHaveBeenCalledWith(MANUAL_PAGE_VIEWPORT_SIZE);
   });
 
   test('uses the virtual display size for manual control', () => {

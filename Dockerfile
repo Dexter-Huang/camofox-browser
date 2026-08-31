@@ -78,6 +78,12 @@ COPY --from=source /src/plugins/ ./plugins/
 # container silently loses the durable-profile feature it exists to provide.
 COPY --from=source /src/mcp/ ./mcp/
 
+# Ensure an empty Compose volume inherits the non-root service owner.
+USER root
+RUN mkdir -p /home/node/.camofox/profiles \
+    && chown -R node:node /home/node/.camofox
+USER node
+
 ENV NODE_ENV=production
 ENV CAMOFOX_PORT=9377
 

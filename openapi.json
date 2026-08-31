@@ -247,6 +247,14 @@
                     },
                     "consecutiveFailures": {
                       "type": "integer"
+                    },
+                    "persistenceReady": {
+                      "type": "boolean",
+                      "description": "Whether the persistent profile directory is writable by the service user."
+                    },
+                    "persistenceError": {
+                      "type": "string",
+                      "nullable": true
                     }
                   }
                 }

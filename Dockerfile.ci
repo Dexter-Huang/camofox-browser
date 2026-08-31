@@ -102,6 +102,8 @@ COPY scripts/ ./scripts/
 RUN sh scripts/install-plugin-deps.sh
 
 # 与 Compose 的持久化 profile 卷所有者一致，避免运行时缓存落入 root 用户目录。
+RUN mkdir -p /home/node/.camofox/profiles \
+    && chown -R node:node /home/node/.camofox
 USER node
 
 ENV NODE_ENV=production

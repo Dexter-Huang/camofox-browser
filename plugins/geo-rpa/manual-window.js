@@ -6,6 +6,7 @@ const POPUP_TIMEOUT_MS = 5000;
 const TASK_WINDOW_POPUP_FEATURES = 'popup=yes,width=1440,height=900';
 export const MANUAL_WINDOW_POPUP_FEATURES = 'popup=yes,width=1920,height=1009';
 const MANUAL_WINDOW_OUTER_SIZE = { width: 1920, height: 1080 };
+export const MANUAL_PAGE_VIEWPORT_SIZE = { width: 1920, height: 1009 };
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -28,10 +29,17 @@ function detachedSleep(milliseconds) {
  */
 async function stabilizeManualPopup(popup) {
   await detachedSleep(250);
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    if (popup.isClosed()) return;
+  for (let attempt = 0; !popup.isClosed(); attempt += 1) {
+    const viewport = popup.viewportSize();
+    if (
+      !viewport ||
+      viewport.width !== MANUAL_PAGE_VIEWPORT_SIZE.width ||
+      viewport.height !== MANUAL_PAGE_VIEWPORT_SIZE.height
+    ) {
+      await popup.setViewportSize(MANUAL_PAGE_VIEWPORT_SIZE);
+    }
     await popup.evaluate(({ width, height }) => window.resizeTo(width, height), MANUAL_WINDOW_OUTER_SIZE);
-    await detachedSleep(100);
+    await detachedSleep(attempt < 60 ? 100 : 1000);
   }
 }
 
@@ -147,6 +155,7 @@ export async function openManualPopup(page, title, targetUrl, { manualWindow = f
     // Headed Firefox owns native window geometry. Let the script-opened
     // window fill the Xvfb directly instead of combining it with Playwright's
     // viewport emulation, which can leave an unpainted right edge.
+    await popup.setViewportSize(MANUAL_PAGE_VIEWPORT_SIZE);
     await popup.evaluate(({ width, height }) => window.resizeTo(width, height), MANUAL_WINDOW_OUTER_SIZE);
   }
   await popup.evaluate((popupTitle) => { document.title = popupTitle; }, title);
@@ -159,6 +168,7 @@ export async function openManualPopup(page, title, targetUrl, { manualWindow = f
     if (manualWindow) {
       // Navigation can restore the opener's native geometry in headed mode;
       // re-apply the fixed outer size after commit before the VNC publisher starts.
+      await popup.setViewportSize(MANUAL_PAGE_VIEWPORT_SIZE);
       await popup.evaluate(({ width, height }) => window.resizeTo(width, height), MANUAL_WINDOW_OUTER_SIZE);
       // Give the compositor one frame to repaint before x11vnc starts publishing
       // the resized native window.

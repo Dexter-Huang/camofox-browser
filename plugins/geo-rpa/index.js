@@ -6,7 +6,11 @@ import {
   openManualPopup,
   waitForNewX11WindowId,
 } from "./manual-window.js";
-import { readX11WindowTree } from "./x11-window.js";
+import {
+  enforceManualWindowGeometry,
+  readX11WindowTree,
+  startManualWindowGeometryGuard,
+} from "./x11-window.js";
 import { startWindowVncPublisher } from "./window-vnc-publisher.js";
 
 // Fast read probes should fail quickly, but a real chat submission can take
@@ -545,6 +549,7 @@ export function register(app, ctx, pluginConfig = {}) {
     const manualWindow = manualWindows.get(handle);
     if (!manualWindow) return false;
     manualWindows.delete(handle);
+    manualWindow.stopGeometryGuard?.();
     await manualWindow.publisher?.stop().catch(() => {});
     await manualWindow.page.close().catch(() => {});
     return true;
@@ -670,6 +675,9 @@ export function register(app, ctx, pluginConfig = {}) {
         existingWindowIds,
         readWindowTree: readX11WindowTree,
       });
+      // Page-level resize requests are advisory in Firefox. Enforce the native
+      // X11 geometry before x11vnc snapshots its framebuffer dimensions.
+      await enforceManualWindowGeometry(browserDisplay, windowId);
       const manualWindow = {
         userId,
         tabId: popupTabId,
@@ -677,14 +685,20 @@ export function register(app, ctx, pluginConfig = {}) {
         page: popup,
         state: "window_ready",
         publisher: null,
+        stopGeometryGuard: null,
       };
       manualWindows.set(identity.handle, manualWindow);
       popup.once("close", () => {
         const activeWindow = manualWindows.get(identity.handle);
         if (activeWindow !== manualWindow) return;
         manualWindows.delete(identity.handle);
+        activeWindow.stopGeometryGuard?.();
         void activeWindow.publisher?.stop().catch(() => {});
       });
+      manualWindow.stopGeometryGuard = startManualWindowGeometryGuard(
+        browserDisplay,
+        windowId,
+      );
       if (manualWindowVnc.enabled) {
         manualWindow.publisher = await startWindowVncPublisher({
           display: browserDisplay,
