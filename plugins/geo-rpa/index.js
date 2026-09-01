@@ -1104,6 +1104,42 @@ export function register(app, ctx, pluginConfig = {}) {
         case "content_editable":
           result = await selected.isEditable({ timeout: LOCATOR_TIMEOUT_MS });
           break;
+        case "generation_stop_visible":
+          result = await selected.evaluate((node) => {
+            // 仅检查已定位输入框附近的停止/取消控件，不能执行调用方提供的脚本，
+            // 也不读取聊天正文。它用于确认 Kimi 仍在生成，避免提前关闭任务页面。
+            const promptRect = node.getBoundingClientRect();
+            return [...document.querySelectorAll('button, [role="button"]')]
+              .filter((control) => {
+                const style = window.getComputedStyle(control);
+                const rect = control.getBoundingClientRect();
+                return (
+                  style.visibility !== "hidden" &&
+                  style.display !== "none" &&
+                  rect.width > 0 &&
+                  rect.height > 0 &&
+                  rect.bottom >= promptRect.top &&
+                  rect.top <= promptRect.bottom &&
+                  rect.left >= promptRect.left + promptRect.width / 2
+                );
+              })
+              .some((control) => {
+                const semantics = [
+                  control.getAttribute("aria-label"),
+                  control.getAttribute("title"),
+                  control.getAttribute("data-testid"),
+                  control.className,
+                ]
+                  .filter((value) => typeof value === "string")
+                  .join(" ")
+                  .toLowerCase();
+                return (
+                  /stop|cancel|abort|pause|停止|终止|取消/.test(semantics) ||
+                  control.querySelector("svg rect") !== null
+                );
+              });
+          });
+          break;
         case "scroll_into_view":
           await selected.scrollIntoViewIfNeeded({
             timeout: LOCATOR_TIMEOUT_MS,
