@@ -456,6 +456,15 @@ function safeError(err) {
   return err.message;
 }
 
+// Tab 创建失败需要给任务详情保留可操作的原因，但不能透传堆栈或认证信息。
+function safeTabCreateDetail(err) {
+  const message = String(err?.message || "Tab creation failed")
+    .replace(/\s+/g, " ")
+    .replace(/(authorization|cookie|token|password|secret)\s*[:=]\s*[^,; ]+/gi, "$1=[redacted]")
+    .trim();
+  return message.slice(0, 300);
+}
+
 function sendError(res, err, extraFields = {}) {
   const status = browserErrorStatus(err) || 500;
   const code = browserErrorCode(err);
@@ -706,6 +715,13 @@ const MAX_CONCURRENT_PER_USER = CONFIG.maxConcurrentPerUser;
 const PAGE_CLOSE_TIMEOUT_MS = 5000;
 const PAGE_FORCE_CLOSE_TIMEOUT_MS = 1000;
 const NAVIGATE_TIMEOUT_MS = CONFIG.navigateTimeoutMs;
+// Tab 创建包含页面分配，以及 `goto(commit)`、`domcontentloaded` 两段等待。
+// 路由预算必须覆盖完整过程，否则接口会先返回泛化 500，而 Playwright 仍在后台继续，
+// 最终可能留下延迟创建的孤儿 Tab。
+const TAB_CREATE_TIMEOUT_MS = Math.max(
+  HANDLER_TIMEOUT_MS,
+  NEW_PAGE_TIMEOUT_MS * 2 + NAVIGATE_TIMEOUT_MS * 2 + 5000,
+);
 const BUILDREFS_TIMEOUT_MS = CONFIG.buildrefsTimeoutMs;
 const NATIVE_MEM_RESTART_THRESHOLD_MB = CONFIG.nativeMemRestartThresholdMb;
 let _nativeMemBaseline = null; // RSS - heapUsed at first idle measurement
@@ -2543,7 +2559,7 @@ async function withPageLoadDuration(action, fn) {
   }
 }
 
-async function navigatePage(page, url, { timeout = 30000 } = {}) {
+async function navigatePage(page, url, { timeout = NAVIGATE_TIMEOUT_MS } = {}) {
   const response = await page.goto(url, { waitUntil: "commit", timeout });
   const contentType =
     response?.headers()?.["content-type"]?.toLowerCase() || "";
@@ -3722,13 +3738,17 @@ app.post("/tabs", async (req, res) => {
         });
         return { tabId, url: page.url() };
       })(),
-      requestTimeoutMs(),
+      requestTimeoutMs(TAB_CREATE_TIMEOUT_MS),
       "tab create",
     );
 
     res.json(result);
   } catch (err) {
-    log("error", "tab create failed", { reqId: req.reqId, error: err.message });
+    log("error", "tab create failed", {
+      reqId: req.reqId,
+      error: err.message,
+      stack: err.stack,
+    });
     // SSL certificate errors on initial navigation — non-retriable
     const isSslError =
       err.message &&
@@ -3747,10 +3767,11 @@ app.post("/tabs", async (req, res) => {
       res.set("fly-replay", `app=${CONFIG.flyAppName || "camofox-browser"}`);
       return res.status(503).json({
         error: safeError(err),
+        detail: safeTabCreateDetail(err),
         code: err.code || "admission_rejected",
       });
     }
-    handleRouteError(err, req, res);
+    handleRouteError(err, req, res, { detail: safeTabCreateDetail(err) });
   }
 });
 
