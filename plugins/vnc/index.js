@@ -29,6 +29,7 @@
  * Or via environment variables (override config):
  *   ENABLE_VNC=1           Enable the plugin
  *   VNC_RESOLUTION=1920x1080
+ *   VNC_PUBLISH_DISPLAY=0  仅保留高分辨率 Xvfb，不发布整屏 VNC
  *   VNC_PASSWORD=secret    Optional password for x11vnc
  *   VIEW_ONLY=1            View-only mode (no mouse/keyboard input)
  *   VNC_PORT=5900          x11vnc listen port
@@ -92,25 +93,28 @@ export async function register(app, ctx, pluginConfig = {}) {
   // --- VNC watcher process ---
   log('info', 'vnc plugin enabled', {
     resolution,
+    publishDisplay: vncConfig.publishDisplay,
     novncPort: vncConfig.novncPort,
     vncPort: vncConfig.vncPort,
     viewOnly: vncConfig.viewOnly,
     passwordProtected: !!vncConfig.vncPassword,
   });
 
-  const watcher = startWatcher({
-    resolution: vncConfig.resolution,
-    vncPassword: vncConfig.vncPassword,
-    viewOnly: vncConfig.viewOnly,
-    vncPort: vncConfig.vncPort,
-    novncPort: vncConfig.novncPort,
-    log,
-    events,
-  });
+  const watcher = vncConfig.publishDisplay
+    ? startWatcher({
+      resolution: vncConfig.resolution,
+      vncPassword: vncConfig.vncPassword,
+      viewOnly: vncConfig.viewOnly,
+      vncPort: vncConfig.vncPort,
+      novncPort: vncConfig.novncPort,
+      log,
+      events,
+    })
+    : null;
 
   // Clean up watcher on server shutdown
   events.on('server:shutdown', () => {
-    if (watcher.exitCode === null) {
+    if (watcher && watcher.exitCode === null) {
       log('info', 'killing vnc watcher on shutdown');
       watcher.kill('SIGTERM');
     }
@@ -118,8 +122,8 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // --- HTTP endpoint: GET /vnc/status ---
   app.get('/vnc/status', (_req, res) => {
-    const watcherRunning = watcher.exitCode === null && !watcher.killed;
-    const vncStatus = watcher.getVncStatus();
+    const watcherRunning = !!watcher && watcher.exitCode === null && !watcher.killed;
+    const vncStatus = watcher ? watcher.getVncStatus() : { running: false };
     res.json({
       enabled: true,
       running: watcherRunning && vncStatus.running,
@@ -169,5 +173,7 @@ export async function register(app, ctx, pluginConfig = {}) {
     }
   });
 
-  log('info', 'vnc plugin: registered VNC endpoints');
+  log('info', 'vnc plugin: registered VNC endpoints', {
+    publishDisplay: vncConfig.publishDisplay,
+  });
 }

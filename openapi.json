@@ -235,6 +235,10 @@
                     "browserRunning": {
                       "type": "boolean"
                     },
+                    "browserReady": {
+                      "type": "boolean",
+                      "description": "Whether Firefox has completed at least one successful startup since this service process started."
+                    },
                     "activeTabs": {
                       "type": "integer"
                     },
@@ -243,6 +247,14 @@
                     },
                     "consecutiveFailures": {
                       "type": "integer"
+                    },
+                    "persistenceReady": {
+                      "type": "boolean",
+                      "description": "Whether the persistent profile directory is writable by the service user."
+                    },
+                    "persistenceError": {
+                      "type": "string",
+                      "nullable": true
                     }
                   }
                 }

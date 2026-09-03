@@ -29,6 +29,11 @@ function compactEnv(env) {
  */
 export function resolveVncConfig(pluginConfig = {}, env = process.env) {
   const enabled = envFlagEnabled(env.ENABLE_VNC) || pluginConfig.enabled === true;
+  // Xvfb 的分辨率覆盖与整屏 VNC 发布是两项独立能力。未指定时保持
+  // 旧行为，部署可显式关闭整屏发布而继续复用大尺寸虚拟显示器。
+  const publishDisplay = env.VNC_PUBLISH_DISPLAY === undefined
+    ? pluginConfig.publishDisplay !== false
+    : envFlagEnabled(env.VNC_PUBLISH_DISPLAY);
 
   const rawResolution = env.VNC_RESOLUTION || pluginConfig.resolution || '1920x1080';
   const resolution = rawResolution.includes('x', rawResolution.indexOf('x') + 1)
@@ -40,7 +45,7 @@ export function resolveVncConfig(pluginConfig = {}, env = process.env) {
   const vncPort = env.VNC_PORT || pluginConfig.vncPort || '5900';
   const novncPort = env.NOVNC_PORT || pluginConfig.novncPort || '6080';
 
-  return { enabled, resolution, vncPassword, viewOnly, vncPort, novncPort };
+  return { enabled, publishDisplay, resolution, vncPassword, viewOnly, vncPort, novncPort };
 }
 
 export function buildWatcherEnv({ resolution, vncPassword, viewOnly, vncPort, novncPort, statusFile }, env = process.env) {

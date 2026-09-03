@@ -163,11 +163,11 @@ On Windows, `make` is not available. Use the included `build.ps1` PowerShell scr
 
 ### Fly.io
 
-For Fly.io or other remote CI, you'll need a Dockerfile that downloads binaries at build time instead of using bind mounts.
+For Fly.io or other remote CI, provide the required `bin/` assets as build-context files or CI artifacts before invoking `Dockerfile.ci`. The image intentionally does not download Camoufox or yt-dlp release assets during the Docker build.
 
 ### Railway
 
-A `railway.toml` is included. It uses `Dockerfile.ci` (which downloads binaries at build time) and maps Railway's `PORT` env var to `CAMOFOX_PORT` automatically.
+A `railway.toml` is included. `Dockerfile.ci` requires pre-downloaded x86_64 Camoufox and yt-dlp assets under `bin/`; it does not download them from GitHub during the Docker build. Provide those files through the build context or an equivalent CI artifact step before deploying. It maps Railway's `PORT` env var to `CAMOFOX_PORT` automatically.
 
 ```bash
 # Install Railway CLI, then:

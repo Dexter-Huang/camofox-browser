@@ -7,6 +7,14 @@
   "plugins": {
     "youtube": { "enabled": true },
     "persistence": { "enabled": true },
-    "vnc": { "enabled": false, "resolution": "1920x1080" }
+    "vnc": { "enabled": true, "resolution": "1920x1080", "publishDisplay": false },
+    "geo-rpa": {
+      "enabled": true,
+      "manualWindowVnc": {
+        "enabled": true,
+        "rfbPort": 5901,
+        "websocketPort": 6081
+      }
+    }
   }
 }

@@ -12,7 +12,7 @@ Extracts video transcripts via yt-dlp (preferred) with Playwright browser fallba
 - `youtube.js` — yt-dlp process management + transcript parsing (`child_process` isolated here)
 - `youtube.test.js` — parser unit tests
 - `apt.txt` — system deps (python3-minimal for yt-dlp)
-- `post-install.sh` — downloads yt-dlp binary
+- `post-install.sh` — 优先安装构建上下文预置的 yt-dlp；独立安装时回退下载
 
 ## Code Separation
 
