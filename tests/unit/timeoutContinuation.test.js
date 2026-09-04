@@ -19,13 +19,17 @@ describe('timed-out tab operations', () => {
 
   test('marks native mouse calls as bounded tab-destroying operations', () => {
     const source = readFileSync(new URL('../../server.js', import.meta.url), 'utf8');
-    const clickStart = source.indexOf("app.post('/tabs/:tabId/click'");
-    const clickRoute = source.slice(clickStart, source.indexOf("app.post('/tabs/:tabId/upload'", clickStart));
+    const clickStart = source.indexOf('app.post("/tabs/:tabId/click"');
+    const clickRoute = source.slice(clickStart, source.indexOf('app.post("/tabs/:tabId/upload"', clickStart));
 
     for (const action of ['move', 'down', 'up']) {
-      expect(clickRoute).toContain(`withTimeout(tabState.page.mouse.${action}`);
+      expect(clickRoute).toMatch(
+        new RegExp(`withTimeout\\(\\s*tabState\\.page\\.mouse\\.${action}`),
+      );
     }
-    expect(clickRoute).toContain("destroyTimedOutTab(session, tabId, 'operation_timeout', userId)");
+    expect(clickRoute).toContain(
+      'destroyTimedOutTab(session, tabId, "operation_timeout", userId)',
+    );
   });
 
   test('returns a stable recoverable error after timeout cleanup', () => {
@@ -34,6 +38,16 @@ describe('timed-out tab operations', () => {
     expect(browserErrorStatus(error)).toBe(410);
     expect(browserErrorCode(error)).toBe('tab_timeout');
     expect(browserErrorRecovery(error)).toBe('create_new_tab');
+  });
+
+  test('recovers the session when tab creation itself reaches the route timeout', () => {
+    const source = readFileSync(new URL('../../server.js', import.meta.url), 'utf8');
+    const tabStart = source.indexOf('app.post("/tabs", async (req, res) =>');
+    const tabRoute = source.slice(tabStart, source.indexOf('app.post("/tabs/:tabId/navigate"', tabStart));
+
+    expect(tabRoute).toContain('destroyTimedOutTabCreation');
+    expect(source).toContain('reason: "tab_create_timeout"');
+    expect(tabRoute).toContain('await abandonExpiredCreation(session)');
   });
 
   test('destroys a tab before releasing queued evaluate work after an evaluate timeout', async () => {

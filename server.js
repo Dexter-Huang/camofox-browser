@@ -815,15 +815,18 @@ async function withTabLock(
 }
 
 function withTimeout(promise, ms, label) {
+  let timer = null;
   return Promise.race([
     promise,
-    new Promise((_, reject) =>
-      setTimeout(
+    new Promise((_, reject) => {
+      timer = setTimeout(
         () => reject(new Error(`${label} timed out after ${ms}ms`)),
         ms,
-      ),
-    ),
-  ]);
+      );
+    }),
+  ]).finally(() => {
+    if (timer !== null) clearTimeout(timer);
+  });
 }
 
 function requestTimeoutMs(baseMs = HANDLER_TIMEOUT_MS) {
@@ -1638,7 +1641,6 @@ async function closeSession(
           "session destroying hook",
         );
       } catch (err) {
-        restartRequired = true;
         log("warn", "session destroying hook timed out or failed", {
           userId: key,
           reason,
@@ -1655,7 +1657,6 @@ async function closeSession(
           );
           log("info", "tracing saved", { userId: key, path: session.tracePath });
         } catch (err) {
-          restartRequired = true;
           log("warn", "tracing.stop timed out or failed", {
             userId: key,
             error: err.message,
@@ -2180,6 +2181,13 @@ async function destroyTimedOutTab(session, tabId, reason, userId) {
       reason,
     });
   }
+}
+
+async function destroyTimedOutTabCreation(userId, session) {
+  const key = normalizeUserId(userId);
+  if (!session || sessions.get(key) !== session) return;
+  log("warn", "destroying session after tab creation timeout", { userId: key });
+  await destroySession(key, { reason: "tab_create_timeout" });
 }
 
 /**
@@ -3645,8 +3653,15 @@ app.post("/pressure/cleanup", async (req, res) => {
  *               $ref: '#/components/schemas/Error'
  */
 app.post("/tabs", async (req, res) => {
+  const userId = req.body?.userId;
+  const tabCreation = { expired: false, session: null, timeoutError: null };
+  const abandonExpiredCreation = async (session) => {
+    if (!tabCreation.expired) return;
+    await destroyTimedOutTabCreation(userId, session);
+    throw tabCreation.timeoutError;
+  };
   try {
-    const { userId, sessionKey, listItemId, url, trace } = req.body;
+    const { sessionKey, listItemId, url, trace } = req.body;
     // Accept both sessionKey (preferred) and listItemId (legacy) for backward compatibility
     const resolvedSessionKey = sessionKey || listItemId;
     if (!userId || !resolvedSessionKey) {
@@ -3687,6 +3702,8 @@ app.post("/tabs", async (req, res) => {
           );
         }
         let session = await getSession(userId, { trace: !!trace });
+        tabCreation.session = session;
+        await abandonExpiredCreation(session);
 
         let totalTabs = 0;
         for (const group of session.tabGroups.values()) totalTabs += group.size;
@@ -3710,6 +3727,8 @@ app.post("/tabs", async (req, res) => {
           { trace: !!trace },
         );
         session = createdPage.session;
+        tabCreation.session = session;
+        await abandonExpiredCreation(session);
         const page = createdPage.page;
         const lease = createdPage.lease;
         const group = getTabGroup(session, resolvedSessionKey);
@@ -3787,6 +3806,8 @@ app.post("/tabs", async (req, res) => {
           tabState.visitedUrls.add(url);
         }
 
+        await abandonExpiredCreation(session);
+
         pluginEvents.emit("tab:created", {
           userId,
           tabId,
@@ -3808,6 +3829,17 @@ app.post("/tabs", async (req, res) => {
 
     res.json(result);
   } catch (err) {
+    if (
+      isTimeoutError(err) &&
+      err.message?.startsWith("tab create timed out after ")
+    ) {
+      tabCreation.expired = true;
+      tabCreation.timeoutError = err;
+      await destroyTimedOutTabCreation(
+        userId,
+        tabCreation.session || sessions.get(normalizeUserId(userId)),
+      );
+    }
     log("error", "tab create failed", {
       reqId: req.reqId,
       error: err.message,
