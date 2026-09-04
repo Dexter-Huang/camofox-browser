@@ -42,6 +42,7 @@ fly.toml
 
 # 本地构建使用的 Camoufox 发行包；由维护者预先下载，禁止提交到仓库。
 /bin/camoufox-135.0.1-beta.24-lin.x86_64.zip
+/bin/ublock_origin-1.74.0.xpi
 /bin/yt-dlp
 /bin/yt-dlp_linux
 

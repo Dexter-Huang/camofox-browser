@@ -19,6 +19,7 @@ import { startWindowVncPublisher } from "./window-vnc-publisher.js";
 // false task failure.
 const LOCATOR_TIMEOUT_MS = 3000;
 const LOCATOR_SCREENSHOT_TIMEOUT_MS = 15_000;
+const SUBMISSION_TRIAL_TIMEOUT_MS = 3000;
 const SUBMISSION_CLICK_TIMEOUT_MS = 12_000;
 const MAX_SELECTOR_LENGTH = 1024;
 const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
@@ -318,13 +319,39 @@ async function selectedLocator(tabState, target) {
 }
 
 async function submitLocatorClick(locator) {
-  // This remains Playwright's normal, actionability-checked click. It does not
-  // force through overlays or inject DOM events. Chat pages often start a
-  // navigation or replace their composer after the click, neither of which is
-  // evidence that the click itself failed, so do not wait for that transition.
+  // 先以 trial 验证同一个 Locator 的可点击性。它不会派发鼠标事件，可避免平台
+  // 刚重绘输入区时直接进入一次结果不明的真实提交；随后仍只执行一次原生 click，
+  // 不强制穿透遮罩、不注入 DOM 事件，也不以 Enter 作为回退。
+  await locator.click({
+    timeout: SUBMISSION_TRIAL_TIMEOUT_MS,
+    trial: true,
+  });
+  // 聊天页点击后可能立即替换输入区或发起导航，这不是 click 失败的证据，因此不等待
+  // 后续页面转换。真实 click 的超时、断链和导航竞态均保持提交结果不明，禁止重试。
   await locator.click({
     timeout: SUBMISSION_CLICK_TIMEOUT_MS,
     noWaitAfter: true,
+  });
+}
+
+function isClosedTabError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  return [
+    "target page, context or browser has been closed",
+    "target closed",
+    "browser has been closed",
+    "context has been closed",
+  ].some((marker) => normalized.includes(marker));
+}
+
+function closedTabResponse(res, tabState, error = null) {
+  // 关闭状态既可能在请求前已由 Playwright 暴露，也可能发生在 Locator await 期间。
+  // 使用稳定错误码让调用方立即停止该 tab 的后续轮询；不把底层异常当作普通 400。
+  if (!tabState.page.isClosed() && !isClosedTabError(error)) return null;
+  return res.status(410).json({
+    error: "Camofox tab has closed",
+    code: "tab_closed",
   });
 }
 
@@ -1006,6 +1033,8 @@ export function register(app, ctx, pluginConfig = {}) {
     const userId = typeof req.body?.userId === "string" ? req.body.userId : "";
     const found = userId && findOwnedTab(sessions, userId, req.params.tabId);
     if (!found) return res.status(404).json({ error: "Tab not found" });
+    const closed = closedTabResponse(res, found.tabState);
+    if (closed) return closed;
     const operation = req.body?.operation;
     try {
       const { locator } = targetLocator(found.tabState, req.body?.target);
@@ -1151,6 +1180,8 @@ export function register(app, ctx, pluginConfig = {}) {
       }
       return res.json({ ok: true, result });
     } catch (error) {
+      const closed = closedTabResponse(res, found.tabState, error);
+      if (closed) return closed;
       return res.status(400).json({ error: safeError(error) });
     }
   });
@@ -1266,12 +1297,16 @@ export function register(app, ctx, pluginConfig = {}) {
     const userId = typeof req.body?.userId === "string" ? req.body.userId : "";
     const found = userId && findOwnedTab(sessions, userId, req.params.tabId);
     if (!found) return res.status(404).json({ error: "Tab not found" });
+    const closed = closedTabResponse(res, found.tabState);
+    if (closed) return closed;
     try {
       await submitLocatorClick(
         await selectedLocator(found.tabState, req.body?.target),
       );
       return res.json({ ok: true });
     } catch (error) {
+      const closed = closedTabResponse(res, found.tabState, error);
+      if (closed) return closed;
       const message = safeError(error);
       return res.status(400).json({
         error: message,
@@ -1286,10 +1321,14 @@ export function register(app, ctx, pluginConfig = {}) {
     const userId = typeof req.body?.userId === "string" ? req.body.userId : "";
     const found = userId && findOwnedTab(sessions, userId, req.params.tabId);
     if (!found) return res.status(404).json({ error: "Tab not found" });
+    const closed = closedTabResponse(res, found.tabState);
+    if (closed) return closed;
     try {
       await submitNearLocator(found.tabState, req.body?.target);
       return res.json({ ok: true });
     } catch (error) {
+      const closed = closedTabResponse(res, found.tabState, error);
+      if (closed) return closed;
       return res.status(400).json({ error: safeError(error) });
     }
   });

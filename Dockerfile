@@ -26,7 +26,9 @@ COPY --from=source /src/bin/yt-dlp ./bin/yt-dlp
 COPY --from=source /src/camofox.config.json ./
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential python3 curl \
-    && CAMOFOX_SKIP_DOWNLOAD=1 npm ci --omit=dev \
+    # 官方 Node 镜像已内置与运行时匹配的头文件。显式传给 node-gyp，避免
+    # better-sqlite3 在构建时额外访问 nodejs.org 下载头文件而受网络波动影响。
+    && CAMOFOX_SKIP_DOWNLOAD=1 npm_config_nodedir=/usr/local npm ci --omit=dev \
     && sh scripts/install-plugin-deps.sh \
     && chmod 755 /usr/local/bin/yt-dlp \
     && apt-get purge -y --auto-remove build-essential \
@@ -50,17 +52,22 @@ WORKDIR /app
 # 已校验的发行包，避免首次创建会话时再从网络下载浏览器。
 USER root
 COPY --from=source --chown=node:node /src/bin/camoufox-135.0.1-beta.24-lin.x86_64.zip /tmp/camoufox.zip
+COPY --from=source --chown=node:node /src/bin/ublock_origin-1.74.0.xpi /tmp/ublock-origin.xpi
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends unzip; \
     mkdir -p /home/node/.cache/camoufox; \
     # Windows 打包的发行包可能令 unzip 返回警告退出码，随后以二进制存在性作完整性校验。
-    (unzip -q /tmp/camoufox.zip -d /home/node/.cache/camoufox || true); \
+    (unzip -oq /tmp/camoufox.zip -d /home/node/.cache/camoufox || true); \
     test -f /home/node/.cache/camoufox/camoufox-bin; \
+    # camoufox-js 会将该目录识别为已预置的默认扩展，浏览器启动时无需访问 addons.mozilla.org。
+    mkdir -p /home/node/.cache/camoufox/addons/UBO; \
+    unzip -oq /tmp/ublock-origin.xpi -d /home/node/.cache/camoufox/addons/UBO; \
+    test -f /home/node/.cache/camoufox/addons/UBO/manifest.json; \
     echo '{"version":"135.0.1","release":"beta.24"}' > /home/node/.cache/camoufox/version.json; \
     chmod -R 755 /home/node/.cache/camoufox; \
     chown -R node:node /home/node/.cache/camoufox; \
-    rm /tmp/camoufox.zip; \
+    rm /tmp/camoufox.zip /tmp/ublock-origin.xpi; \
     apt-get purge -y --auto-remove unzip; \
     rm -rf /var/lib/apt/lists/*
 USER node
