@@ -62,6 +62,7 @@ import {
 import { coalesceInflight } from "./lib/inflight.js";
 import { createScreenshotBroker } from "./lib/screenshot-broker.js";
 import { createPageWithSessionRecovery } from "./lib/new-page-recovery.js";
+import { waitForOperation } from "./lib/bounded-operation.js";
 import { resolveUploadPaths } from "./lib/upload-paths.js";
 import {
   acquirePageLease,
@@ -702,6 +703,7 @@ let _lastBrowserRestartAt = 0; // Timestamp of last browser relaunch (for stale 
 // TabState = { page, refs: Map<refId, {role, name, nth}>, visitedUrls: Set, downloads: Array, toolCalls: number }
 // Note: sessionKey was previously called listItemId - both are accepted for backward compatibility
 const sessions = new Map();
+const closingSessions = new Map();
 
 const SESSION_TIMEOUT_MS = CONFIG.sessionTimeoutMs;
 const MAX_SNAPSHOT_NODES = 500;
@@ -714,6 +716,8 @@ const NEW_PAGE_TIMEOUT_MS = CONFIG.newPageTimeoutMs;
 const MAX_CONCURRENT_PER_USER = CONFIG.maxConcurrentPerUser;
 const PAGE_CLOSE_TIMEOUT_MS = 5000;
 const PAGE_FORCE_CLOSE_TIMEOUT_MS = 1000;
+const SESSION_CLEANUP_TIMEOUT_MS = 10_000;
+const CONTEXT_CLOSE_TIMEOUT_MS = 10_000;
 const NAVIGATE_TIMEOUT_MS = CONFIG.navigateTimeoutMs;
 // Tab 创建包含页面分配，以及 `goto(commit)`、`domcontentloaded` 两段等待。
 // 路由预算必须覆盖完整过程，否则接口会先返回泛化 500，而 Playwright 仍在后台继续，
@@ -1615,29 +1619,87 @@ async function closeSession(
 
   // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"
   // (410) instead of messy "Target page closed" (500) errors.
-  if (clearLocks) {
-    clearSessionLocks(session);
-  }
+  if (session._closePromise) return session._closePromise;
 
-  if (clearDownloads) {
-    await clearSessionDownloads(session).catch(() => {});
-  }
+  session._closing = true;
+  if (sessions.get(key) === session) sessions.delete(key);
 
-  await pluginEvents.emitAsync("session:destroying", { userId: key, reason });
-  if (session.tracePath) {
+  let closePromise;
+  closePromise = (async () => {
+    let restartRequired = false;
     try {
-      await session.context.tracing.stop({ path: session.tracePath });
-      log("info", "tracing saved", { userId: key, path: session.tracePath });
-    } catch (err) {
-      log("warn", "tracing.stop failed", { userId: key, error: err.message });
+      if (clearLocks) clearSessionLocks(session);
+      if (clearDownloads) await clearSessionDownloads(session).catch(() => {});
+
+      try {
+        await waitForOperation(
+          pluginEvents.emitAsync("session:destroying", { userId: key, reason }),
+          SESSION_CLEANUP_TIMEOUT_MS,
+          "session destroying hook",
+        );
+      } catch (err) {
+        restartRequired = true;
+        log("warn", "session destroying hook timed out or failed", {
+          userId: key,
+          reason,
+          error: err.message,
+        });
+      }
+
+      if (session.tracePath) {
+        try {
+          await waitForOperation(
+            session.context.tracing.stop({ path: session.tracePath }),
+            SESSION_CLEANUP_TIMEOUT_MS,
+            "session trace stop",
+          );
+          log("info", "tracing saved", { userId: key, path: session.tracePath });
+        } catch (err) {
+          restartRequired = true;
+          log("warn", "tracing.stop timed out or failed", {
+            userId: key,
+            error: err.message,
+          });
+        }
+      }
+
+      try {
+        await waitForOperation(
+          session.context.close(),
+          CONTEXT_CLOSE_TIMEOUT_MS,
+          "browser context close",
+        );
+      } catch (err) {
+        restartRequired = true;
+        log("warn", "browser context close timed out or failed", {
+          userId: key,
+          reason,
+          error: err.message,
+        });
+      }
+
+      if (restartRequired) await restartBrowser(`session_cleanup:${reason}`);
+    } finally {
+      try {
+        await waitForOperation(
+          pluginEvents.emitAsync("session:destroyed", { userId: key, reason }),
+          SESSION_CLEANUP_TIMEOUT_MS,
+          "session destroyed hook",
+        );
+      } catch (err) {
+        log("warn", "session destroyed hook timed out or failed", {
+          userId: key,
+          reason,
+          error: err.message,
+        });
+      }
+      if (closingSessions.get(key) === closePromise) closingSessions.delete(key);
+      refreshActiveTabsGauge();
     }
-  }
-
-  await session.context.close().catch(() => {});
-  sessions.delete(key);
-  await pluginEvents.emitAsync("session:destroyed", { userId: key, reason });
-
-  refreshActiveTabsGauge();
+  })();
+  session._closePromise = closePromise;
+  closingSessions.set(key, closePromise);
+  return closePromise;
 }
 
 async function closeAllSessions(
@@ -1652,6 +1714,8 @@ async function closeAllSessions(
 
 async function getSession(userId, { trace = false } = {}) {
   const key = normalizeUserId(userId);
+  const closing = closingSessions.get(key);
+  if (closing) await closing;
   let session = sessions.get(key);
 
   // Check if existing session's context is still alive
