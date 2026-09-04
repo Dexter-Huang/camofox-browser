@@ -3839,6 +3839,18 @@ app.post("/tabs", async (req, res) => {
         userId,
         tabCreation.session || sessions.get(normalizeUserId(userId)),
       );
+      log("error", "tab create timed out", {
+        reqId: req.reqId,
+        error: err.message,
+      });
+      // The route budget is already exhausted. Returning a distinct 504 lets
+      // the RPA client stop retrying this same navigation storm immediately;
+      // the session cleanup above has released any partially-created page.
+      return res.status(504).json({
+        error: "Camofox tab creation timed out",
+        code: "tab_create_timeout",
+        recoverable: false,
+      });
     }
     log("error", "tab create failed", {
       reqId: req.reqId,

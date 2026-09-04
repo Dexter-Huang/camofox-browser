@@ -50,6 +50,16 @@ describe('timed-out tab operations', () => {
     expect(tabRoute).toContain('await abandonExpiredCreation(session)');
   });
 
+  test('returns a terminal 504 for an exhausted tab creation budget', () => {
+    const source = readFileSync(new URL('../../server.js', import.meta.url), 'utf8');
+    const tabStart = source.indexOf('app.post("/tabs", async (req, res) =>');
+    const tabRoute = source.slice(tabStart, source.indexOf('app.post("/tabs/:tabId/navigate"', tabStart));
+
+    expect(tabRoute).toContain('res.status(504).json');
+    expect(tabRoute).toContain('code: "tab_create_timeout"');
+    expect(tabRoute).toContain('recoverable: false');
+  });
+
   test('destroys a tab before releasing queued evaluate work after an evaluate timeout', async () => {
     const client = createClient(serverUrl);
     const { tabId } = await client.createTab();
