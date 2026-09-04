@@ -1,99 +1,70 @@
-# 源码固定从 GEO 维护的 fork 拉取；不要在 Dockerfile 中引用未审查的第三方浮动分支。
-# 本地开发/验收默认使用已构建的本机基础镜像，不在 Docker build 中隐式拉取远程镜像。
-# 需要从零构建时，显式传入 CAMOUFOX_RUNTIME_IMAGE 和 CAMOFOX_BROWSER_BASE_IMAGE。
-ARG CAMOUFOX_RUNTIME_IMAGE=geo-camofox-browser:jo-local
-ARG CAMOFOX_BROWSER_BASE_IMAGE=geo-camofox-browser-base:jo-local
+# 构建上下文是当前子模块根目录。浏览器归档由受控发布流程放入 bin/，运行时绝不下载浏览器。
+FROM python:3.12-slim-bookworm
 
-# 仅复用已验证的 Firefox/Camoufox 二进制层；服务代码来自当前构建上下文中的
-# Dexter-Huang/camofox-browser fork。二进制来源不改变服务 API 的源码归属。
-FROM ${CAMOUFOX_RUNTIME_IMAGE} AS camoufox-runtime
-
-FROM camoufox-runtime AS source
-WORKDIR /src
-COPY . ./
-
-# 预镜像复用已验证的浏览器运行时，并固化 fork 的锁文件依赖与插件依赖。
-# 这样服务源码改动不会触发浏览器、系统包或 npm 依赖的重复安装。
-FROM camoufox-runtime AS camofox-browser-base
-USER root
 WORKDIR /app
-COPY --from=source /src/package.json /src/package-lock.json ./
-COPY --from=source /src/scripts/ ./scripts/
-COPY --from=source /src/plugins/ ./plugins/
-COPY --from=source /src/bin/yt-dlp ./bin/yt-dlp
-# 插件依赖脚本只依据 /app/camofox.config.json 决定安装集合。必须在执行脚本前
-# 复制当前 fork 的配置，否则 vnc 等新启用插件会因读取到基础镜像旧配置而漏装依赖。
-COPY --from=source /src/camofox.config.json ./
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    PYTHONPATH=/app \
+    VIRTUAL_ENV=/app/.venv \
+    PATH=/app/.venv/bin:$PATH
+
+COPY --from=ghcr.io/astral-sh/uv:0.12.1 /uv /uvx /bin/
+
+# Firefox/Camoufox 的动态库和字体。服务不包含 Node 业务运行时；Playwright Python 自带的
+# driver 仅作为控制通道使用，浏览器可执行文件来自下方固定的本地发行包。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential python3 curl \
-    # 官方 Node 镜像已内置与运行时匹配的头文件。显式传给 node-gyp，避免
-    # better-sqlite3 在构建时额外访问 nodejs.org 下载头文件而受网络波动影响。
-    && CAMOFOX_SKIP_DOWNLOAD=1 npm_config_nodedir=/usr/local npm ci --omit=dev \
-    && sh scripts/install-plugin-deps.sh \
-    && chmod 755 /usr/local/bin/yt-dlp \
-    && apt-get purge -y --auto-remove build-essential \
+    && apt-get install -y --no-install-recommends \
+        bash ca-certificates unzip \
+        libasound2 libdbus-glib-1-2 libegl1 libgbm1 libgl1-mesa-dri \
+        libgtk-3-0 libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 \
+        libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 \
+        fonts-liberation fonts-noto-color-emoji fontconfig \
+        xvfb x11vnc novnc python3-websockify x11-utils \
     && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./requirements.txt
+RUN uv venv --python /usr/local/bin/python /app/.venv \
+    && uv pip install --python /app/.venv/bin/python -r requirements.txt
+
+# 固定的官方 Camoufox 归档由操作者预先放入 bin/。COPY 层位于应用源码
+# 之前，业务代码或测试变动会复用该解压后的浏览器层，不会重复下载。
+# 不匹配的归档立即失败，绝不退回到启动或构建时在线下载。
+COPY bin/camoufox-152.0.4-beta.29-lin.x86_64.zip /tmp/camoufox.zip
+ENV XDG_CACHE_HOME=/home/node/.cache
+RUN echo "1bea4b55a51c88e82dc7d426d9c75093d942d2afc8c911cb8fc78ebf723d686c  /tmp/camoufox.zip" | sha256sum -c - \
+    && mkdir -p /home/node/.cache/camoufox/browsers/official/152.0.4-beta.29 \
+    && unzip -q /tmp/camoufox.zip -d /home/node/.cache/camoufox/browsers/official/152.0.4-beta.29 \
+    && test -f /home/node/.cache/camoufox/browsers/official/152.0.4-beta.29/camoufox-bin \
+    && printf '{"version":"152.0.4","build":"beta.29","prerelease":true}\n' > /home/node/.cache/camoufox/browsers/official/152.0.4-beta.29/version.json \
+    && printf '{"active_version":"browsers/official/152.0.4-beta.29"}\n' > /home/node/.cache/camoufox/config.json \
+    && touch /home/node/.cache/camoufox/.0.5_FLAG \
+    && chmod -R 755 /home/node/.cache/camoufox \
+    && rm /tmp/camoufox.zip
+
+# Debian 的 novnc 包仅用于提供静态网页，却会带入 Node.js 和一组运行期不需要
+# 的 Python 依赖。复制静态资源后立刻卸载这些包；6080 的 WebSocket-to-RFB
+# 桥接由 app.novnc 中的 Python ASGI 进程承担，最终镜像不保留 Node 运行时。
+RUN mkdir -p /app/novnc \
+    && cp -a /usr/share/novnc/. /app/novnc/ \
+    && apt-get purge -y --auto-remove novnc python3-websockify nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && ! command -v node \
+    && ! command -v nodejs \
+    && ! command -v websockify
+
+RUN useradd --create-home --uid 1000 node \
+    && mkdir -p /home/node/.camofox/profiles \
+    && chown -R node:node /home/node /app
 USER node
 
-# 发布基础镜像时构建到 ``camofox-browser-base`` target；应用镜像可改用已发布的同版本基础镜像。
-FROM ${CAMOFOX_BROWSER_BASE_IMAGE} AS camofox-browser
+COPY --chown=node:node app ./app
+COPY --chown=node:node docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
 
-# GHCR 使用这些 OCI 标签追溯最终应用镜像到 GEO fork 的固定 revision。
-ARG CAMOFOX_BROWSER_REPOSITORY=https://github.com/Dexter-Huang/camofox-browser.git
-ARG CAMOFOX_BROWSER_REV=e5a36f5cd0332fde6597de474329a308a53a0716
-LABEL org.opencontainers.image.source="${CAMOFOX_BROWSER_REPOSITORY}" \
-      org.opencontainers.image.revision="${CAMOFOX_BROWSER_REV}" \
-      org.opencontainers.image.title="geo-camofox-browser"
-
-WORKDIR /app
-
-# 最终服务以 node 用户启动，而 camoufox-js 只会从该用户的缓存目录读取浏览器。
-# 预构建运行时镜像中的 /root 缓存不会自动继承到这里；显式使用构建上下文内
-# 已校验的发行包，避免首次创建会话时再从网络下载浏览器。
-USER root
-COPY --from=source --chown=node:node /src/bin/camoufox-135.0.1-beta.24-lin.x86_64.zip /tmp/camoufox.zip
-COPY --from=source --chown=node:node /src/bin/ublock_origin-1.74.0.xpi /tmp/ublock-origin.xpi
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends unzip; \
-    mkdir -p /home/node/.cache/camoufox; \
-    # Windows 打包的发行包可能令 unzip 返回警告退出码，随后以二进制存在性作完整性校验。
-    (unzip -oq /tmp/camoufox.zip -d /home/node/.cache/camoufox || true); \
-    test -f /home/node/.cache/camoufox/camoufox-bin; \
-    # camoufox-js 会将该目录识别为已预置的默认扩展，浏览器启动时无需访问 addons.mozilla.org。
-    mkdir -p /home/node/.cache/camoufox/addons/UBO; \
-    unzip -oq /tmp/ublock-origin.xpi -d /home/node/.cache/camoufox/addons/UBO; \
-    test -f /home/node/.cache/camoufox/addons/UBO/manifest.json; \
-    echo '{"version":"135.0.1","release":"beta.24"}' > /home/node/.cache/camoufox/version.json; \
-    chmod -R 755 /home/node/.cache/camoufox; \
-    chown -R node:node /home/node/.cache/camoufox; \
-    rm /tmp/camoufox.zip /tmp/ublock-origin.xpi; \
-    apt-get purge -y --auto-remove unzip; \
-    rm -rf /var/lib/apt/lists/*
-USER node
-
-COPY --from=source /src/server.js ./
-COPY --from=source /src/camofox.config.json ./
-COPY --from=source /src/lib/ ./lib/
-# 插件源代码属于快速迭代层；依赖仍固定在预镜像，避免普通 REST 协议修复触发
-# Firefox、系统包与 npm 依赖的完整重装。
-COPY --from=source /src/plugins/ ./plugins/
-# lib/cookies.js is a compatibility re-export from ../mcp/lib/cookies.mjs, so mcp/
-# must ship even though the MCP server itself is not run here. Without it the
-# persistence plugin dies at load with ERR_MODULE_NOT_FOUND, the server starts
-# anyway, /health keeps reporting ok, and no profile is ever written -- i.e. the
-# container silently loses the durable-profile feature it exists to provide.
-COPY --from=source /src/mcp/ ./mcp/
-
-# Ensure an empty Compose volume inherits the non-root service owner.
-USER root
-RUN mkdir -p /home/node/.camofox/profiles \
-    && chown -R node:node /home/node/.camofox
-USER node
-
-ENV NODE_ENV=production
-ENV CAMOFOX_PORT=9377
-
+ENV CAMOFOX_PROFILE_DIR=/home/node/.camofox/profiles \
+    CAMOFOX_PORT=9377
 EXPOSE 9377
-
-CMD ["sh", "-c", "node --max-old-space-size=${MAX_OLD_SPACE_SIZE:-128} server.js"]
+EXPOSE 5900 6080
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9377"]
