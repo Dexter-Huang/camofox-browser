@@ -1,0 +1,65 @@
+# Camofox 构建基座：仅在系统依赖、Python 依赖或审核过的浏览器归档变更时重建。
+# 业务 sidecar 代码位于派生 Dockerfile，日常规则调整不会重复下载或解压这些大层。
+FROM python:3.12-slim-bookworm
+
+WORKDIR /app
+ARG APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    PYTHONPATH=/app \
+    VIRTUAL_ENV=/app/.venv \
+    PATH=/app/.venv/bin:$PATH \
+    UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 基础镜像使用国内 Debian 镜像，覆盖主仓库、updates 和 security 三个 Bookworm 源。
+# 保留构建参数是为了在受控网络中切换到经批准的镜像，而不是在 Dockerfile 中写死私有地址。
+# 同时避免将 GHCR 作为 uv 二进制来源；uv 版本仍固定，只用于构建期安装依赖。
+RUN sed -i \
+        -e "s|http://deb.debian.org/debian|${APT_MIRROR}/debian|g" \
+        -e "s|http://security.debian.org/debian-security|${APT_MIRROR}/debian-security|g" \
+        -e "s|https://deb.debian.org/debian|${APT_MIRROR}/debian|g" \
+        -e "s|https://security.debian.org/debian-security|${APT_MIRROR}/debian-security|g" \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash ca-certificates unzip \
+        libasound2 libdbus-glib-1-2 libegl1 libgbm1 libgl1-mesa-dri \
+        libgtk-3-0 libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 \
+        libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 \
+        fonts-liberation fonts-noto-color-emoji fontconfig \
+        xvfb x11vnc novnc python3-websockify x11-utils \
+    && pip install --no-cache-dir --index-url https://pypi.tuna.tsinghua.edu.cn/simple uv==0.12.1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./requirements.txt
+RUN uv venv --python /usr/local/bin/python /app/.venv \
+    && uv pip install --python /app/.venv/bin/python -r requirements.txt
+
+# 固定归档是受控构建输入。哈希不匹配时必须失败，不能在线下载替代版本。
+COPY bin/camoufox-152.0.4-beta.29-lin.x86_64.zip /tmp/camoufox.zip
+ENV XDG_CACHE_HOME=/home/node/.cache
+RUN echo "1bea4b55a51c88e82dc7d426d9c75093d942d2afc8c911cb8fc78ebf723d686c  /tmp/camoufox.zip" | sha256sum -c - \
+    && mkdir -p /home/node/.cache/camoufox/browsers/official/152.0.4-beta.29 \
+    && unzip -q /tmp/camoufox.zip -d /home/node/.cache/camoufox/browsers/official/152.0.4-beta.29 \
+    && test -f /home/node/.cache/camoufox/browsers/official/152.0.4-beta.29/camoufox-bin \
+    && printf '{"version":"152.0.4","build":"beta.29","prerelease":true}\n' > /home/node/.cache/camoufox/browsers/official/152.0.4-beta.29/version.json \
+    && printf '{"active_version":"browsers/official/152.0.4-beta.29"}\n' > /home/node/.cache/camoufox/config.json \
+    && touch /home/node/.cache/camoufox/.0.5_FLAG \
+    && chmod -R 755 /home/node/.cache/camoufox \
+    && rm /tmp/camoufox.zip
+
+# Debian 的 novnc 仅提供静态页面，运行期桥接由 app.novnc 承担。
+RUN mkdir -p /app/novnc \
+    && cp -a /usr/share/novnc/. /app/novnc/ \
+    && apt-get purge -y --auto-remove novnc python3-websockify nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && ! command -v node \
+    && ! command -v nodejs \
+    && ! command -v websockify
+
+RUN useradd --create-home --uid 1000 node \
+    && mkdir -p /home/node/.camofox/profiles \
+    && chown -R node:node /home/node /app
+
+USER node

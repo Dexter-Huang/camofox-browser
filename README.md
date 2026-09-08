@@ -77,13 +77,19 @@ The Dockerfile verifies this SHA-256 before extracting it:
 1bea4b55a51c88e82dc7d426d9c75093d942d2afc8c911cb8fc78ebf723d686c
 ```
 
-The Docker build context is the submodule root. It uses the fixed
-`python:3.12-slim-bookworm` base image and fails when the archive is absent,
-has an unexpected hash, or lacks `camoufox-bin`. The image contains no Node
-runtime and does not download a browser at build or runtime.
+The Docker build context is the submodule root. `Dockerfile.base` builds a
+versioned local base image containing system libraries, fixed Python
+dependencies, and the verified archive. It uses Tsinghua Debian and PyPI
+mirrors and never pulls `uv` from GHCR. `Dockerfile` derives from that base
+and copies only `app/` and the entrypoint, so routine rule changes do not
+repeat dependency installation or browser extraction. The base image uses the
+fixed `python:3.12-slim-bookworm` image and fails when the archive is absent,
+has an unexpected hash, or lacks `camoufox-bin`. Neither image contains Node
+runtime or downloads a browser at build or runtime.
 
 ```bash
-docker build -t geo-camofox-browser:python-v3 .
+docker build -f Dockerfile.base -t geo-camofox-browser-base:py312-camoufox152.0.4b29 .
+docker build --build-arg CAMOFOX_BROWSER_BASE_IMAGE=geo-camofox-browser-base:py312-camoufox152.0.4b29 -t geo-camofox-browser:local .
 ```
 
 ## Validation
