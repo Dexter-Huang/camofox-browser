@@ -65,6 +65,8 @@ MAX_MANUAL_TEXT_LENGTH = 10_000
 MAX_COORDINATE = 10_000
 MAX_WHEEL_DELTA = 10_000
 SESSION_CLOSE_TIMEOUT_SECONDS = 15
+STORAGE_STATE_TIMEOUT_SECONDS = 12
+TAB_CLOSE_TIMEOUT_SECONDS = 8
 TAB_CREATE_TIMEOUT_SECONDS = 95
 VNC_DEFAULT_RESOLUTION = "1920x1080x24"
 WINDOW_PUBLISHER_WS_BASE_PORT = 6082
@@ -254,6 +256,11 @@ EXECUTION_CREATE_OPENAPI_SCHEMA = ExecutionCreateRequest.model_json_schema(
 )
 
 
+def profile_log_id(user_id: str) -> str:
+    """返回可跨日志关联、但不泄露账号标识的短哈希。"""
+    return hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:12]
+
+
 class KeepalivePayload(TypedDict):
     status: Literal["ok", "login_required", "verification_required", "uncertain"]
 
@@ -440,21 +447,47 @@ class BrowserService:
     async def _save_state(self, session: SessionState) -> bool:
         """将受限 StorageState 原子写回账号卷，返回本次 checkpoint 是否成功。"""
         path = self._state_path(session.user_id)
+        started_at = time.monotonic()
+        log_id = profile_log_id(session.user_id)
+        logger.info("CAMOFOX_CHECKPOINT stage=started profile=%s", log_id)
         try:
             # Kimi 等平台会把会话令牌写入 IndexedDB。只保存 Cookie/LocalStorage
             # 会导致人工认证页面看似成功，但 Context 或 Firefox 进程退出后重新打开
             # 又回到登录页。Playwright StorageState 支持该受限快照，仍不触及完整
             # Firefox profile、浏览历史或浏览器扩展数据。
-            state = await session.context.storage_state(indexed_db=True)
+            # StorageState 通过 Firefox 的 Juggler 通道导出。页面在人工 VNC 中
+            # 停滞时该 RPC 也可能不返回；认证完成接口必须在网关超时前失败，让
+            # 管理端仍能选择取消会话，而不是永久停留在“完成中”。
+            state = await asyncio.wait_for(
+                session.context.storage_state(indexed_db=True),
+                timeout=STORAGE_STATE_TIMEOUT_SECONDS,
+            )
             payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
             await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
             temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
             await asyncio.to_thread(temporary.write_text, payload, "utf-8")
             await asyncio.to_thread(temporary.replace, path)
+            logger.info(
+                "CAMOFOX_CHECKPOINT stage=completed profile=%s elapsed_ms=%s",
+                log_id,
+                int((time.monotonic() - started_at) * 1000),
+            )
             return True
-        except Exception as exc:
+        except TimeoutError:
+            logger.warning(
+                "CAMOFOX_CHECKPOINT stage=timed_out profile=%s timeout_seconds=%s elapsed_ms=%s",
+                log_id,
+                STORAGE_STATE_TIMEOUT_SECONDS,
+                int((time.monotonic() - started_at) * 1000),
+            )
+            return False
+        except Exception:
             # 登录态内容绝不写入日志，checkpoint 失败也不能阻止 Context 正常关闭。
-            logger.exception("StorageState checkpoint failed")
+            logger.exception(
+                "CAMOFOX_CHECKPOINT stage=failed profile=%s elapsed_ms=%s",
+                log_id,
+                int((time.monotonic() - started_at) * 1000),
+            )
             return False
 
     async def session_for(self, user_id: str) -> SessionState:
@@ -517,6 +550,9 @@ class BrowserService:
 
     async def _finalize_session_close(self, session: SessionState) -> None:
         """完成单个 Context 的关闭屏障，并在关闭无法确认时恢复浏览器进程。"""
+        started_at = time.monotonic()
+        log_id = profile_log_id(session.user_id)
+        logger.info("CAMOFOX_SESSION_CLOSE stage=started profile=%s", log_id)
         try:
             async with session.lock:
                 await self._close_windows_for_user(session.user_id)
@@ -526,8 +562,18 @@ class BrowserService:
                 try:
                     await asyncio.wait_for(session.context.close(), SESSION_CLOSE_TIMEOUT_SECONDS)
                 except Exception:
-                    logger.warning("Camoufox session close timed out; restarting browser")
+                    logger.warning(
+                        "CAMOFOX_SESSION_CLOSE stage=context_close_failed profile=%s elapsed_ms=%s; restarting browser",
+                        log_id,
+                        int((time.monotonic() - started_at) * 1000),
+                    )
                     await self._restart_browser()
+                else:
+                    logger.info(
+                        "CAMOFOX_SESSION_CLOSE stage=completed profile=%s elapsed_ms=%s",
+                        log_id,
+                        int((time.monotonic() - started_at) * 1000),
+                    )
         finally:
             async with self.sessions_lock:
                 self.closing_sessions.pop(session.user_id, None)
@@ -709,6 +755,8 @@ class BrowserService:
 
     async def close_managed_window(self, handle: str, user_id: str) -> bool:
         """幂等结束窗口租约，先撤销 publisher 再关闭该账号 popup。"""
+        started_at = time.monotonic()
+        log_id = profile_log_id(user_id)
         async with self._window_lock:
             window = self.windows.get(handle)
             if window is None or window.user_id != user_id:
@@ -719,9 +767,49 @@ class BrowserService:
                 window.tab.session.tabs.pop(window.tab.tab_id, None)
         if window.publisher is not None:
             await window.publisher.stop()
-        if not window.tab.page.is_closed():
-            with suppress(Exception):
-                await window.tab.page.close()
+        logger.info(
+            "CAMOFOX_MANUAL_WINDOW_CLOSE stage=started profile=%s handle=%s",
+            log_id,
+            handle,
+        )
+        if window.tab.page.is_closed():
+            logger.info(
+                "CAMOFOX_MANUAL_WINDOW_CLOSE stage=already_closed profile=%s handle=%s elapsed_ms=%s",
+                log_id,
+                handle,
+                int((time.monotonic() - started_at) * 1000),
+            )
+            return True
+        try:
+            await asyncio.wait_for(
+                window.tab.page.close(), timeout=TAB_CLOSE_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            # 即使 popup 的 Juggler RPC 卡住，后续 Context close 仍会尝试回收；
+            # 删除 Tab 的 HTTP 调用不能因此无限等待。
+            logger.warning(
+                "CAMOFOX_MANUAL_WINDOW_CLOSE stage=timed_out profile=%s handle=%s "
+                "timeout_seconds=%s elapsed_ms=%s",
+                log_id,
+                handle,
+                TAB_CLOSE_TIMEOUT_SECONDS,
+                int((time.monotonic() - started_at) * 1000),
+            )
+        except Exception:
+            logger.warning(
+                "CAMOFOX_MANUAL_WINDOW_CLOSE stage=failed profile=%s handle=%s elapsed_ms=%s",
+                log_id,
+                handle,
+                int((time.monotonic() - started_at) * 1000),
+                exc_info=True,
+            )
+        else:
+            logger.info(
+                "CAMOFOX_MANUAL_WINDOW_CLOSE stage=completed profile=%s handle=%s elapsed_ms=%s",
+                log_id,
+                handle,
+                int((time.monotonic() - started_at) * 1000),
+            )
         return True
 
     def _next_window_ports(self) -> tuple[int, int]:
@@ -806,8 +894,38 @@ class BrowserService:
                 return
             tab.session.tabs.pop(tab.tab_id, None)
             tab.captures.clear()
-            with suppress(Exception):
-                await tab.page.close()
+            started_at = time.monotonic()
+            log_id = profile_log_id(tab.session.user_id)
+            logger.info(
+                "CAMOFOX_TAB_CLOSE stage=started profile=%s tab_id=%s", log_id, tab.tab_id
+            )
+            try:
+                await asyncio.wait_for(tab.page.close(), timeout=TAB_CLOSE_TIMEOUT_SECONDS)
+            except TimeoutError:
+                # 后续 session close 会继续关闭 Context，必要时重建浏览器；单个过期
+                # Tab 不能无限阻塞 HTTP 取消路径。
+                logger.warning(
+                    "CAMOFOX_TAB_CLOSE stage=timed_out profile=%s tab_id=%s timeout_seconds=%s elapsed_ms=%s",
+                    log_id,
+                    tab.tab_id,
+                    TAB_CLOSE_TIMEOUT_SECONDS,
+                    int((time.monotonic() - started_at) * 1000),
+                )
+            except Exception:
+                logger.warning(
+                    "CAMOFOX_TAB_CLOSE stage=failed profile=%s tab_id=%s elapsed_ms=%s",
+                    log_id,
+                    tab.tab_id,
+                    int((time.monotonic() - started_at) * 1000),
+                    exc_info=True,
+                )
+            else:
+                logger.info(
+                    "CAMOFOX_TAB_CLOSE stage=completed profile=%s tab_id=%s elapsed_ms=%s",
+                    log_id,
+                    tab.tab_id,
+                    int((time.monotonic() - started_at) * 1000),
+                )
 
     async def create_execution(
         self, execution_id: str, provider: ProviderName, profile_key: str, query: str

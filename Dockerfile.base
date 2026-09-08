@@ -10,7 +10,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
     VIRTUAL_ENV=/app/.venv \
     PATH=/app/.venv/bin:$PATH \
-    UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+    UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    TZ=Asia/Shanghai
 
 # 基础镜像使用国内 Debian 镜像，覆盖主仓库、updates 和 security 三个 Bookworm 源。
 # 保留构建参数是为了在受控网络中切换到经批准的镜像，而不是在 Dockerfile 中写死私有地址。
@@ -23,13 +24,15 @@ RUN sed -i \
         /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        bash ca-certificates unzip \
+        bash ca-certificates unzip tzdata \
         libasound2 libdbus-glib-1-2 libegl1 libgbm1 libgl1-mesa-dri \
         libgtk-3-0 libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 \
         libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 \
         fonts-liberation fonts-noto-color-emoji fontconfig \
         xvfb x11vnc novnc python3-websockify x11-utils \
     && pip install --no-cache-dir --index-url https://pypi.tuna.tsinghua.edu.cn/simple uv==0.12.1 \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./requirements.txt

@@ -18,6 +18,7 @@ from app.main import (
     BrowserService,
     Capture,
     Execution,
+    ManagedWindow,
     ProtocolError,
     SessionState,
     TabState,
@@ -1083,6 +1084,66 @@ def test_storage_state_checkpoint_includes_indexed_db(tmp_path: Path) -> None:
         assert await instance._save_state(SessionState(user_id="user-1", context=context)) is True
 
         context.storage_state.assert_awaited_once_with(indexed_db=True)
+
+    asyncio.run(run())
+
+
+def test_storage_state_checkpoint_times_out_without_blocking_shutdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Firefox 未响应 StorageState 时，认证完成接口必须在有限时间内失败。"""
+
+    async def run() -> None:
+        context = AsyncMock()
+        stalled = asyncio.Event()
+
+        async def storage_state(*, indexed_db: bool) -> dict[str, object]:
+            assert indexed_db is True
+            await stalled.wait()
+            return {"cookies": [], "origins": []}
+
+        context.storage_state.side_effect = storage_state
+        instance = BrowserService()
+        instance.profile_dir = tmp_path
+        monkeypatch.setattr("app.main.STORAGE_STATE_TIMEOUT_SECONDS", 0.01)
+
+        assert await instance._save_state(SessionState(user_id="user-1", context=context)) is False
+
+    asyncio.run(run())
+
+
+def test_manual_window_close_times_out_without_blocking_session_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """人工 popup 的关闭 RPC 卡住时，删除请求仍需进入后续 Context 回收。"""
+
+    async def run() -> None:
+        service = BrowserService()
+        page = Mock()
+        page.is_closed.return_value = False
+        stalled = asyncio.Event()
+
+        async def close_page() -> None:
+            await stalled.wait()
+
+        page.close = AsyncMock(side_effect=close_page)
+        session = SessionState(user_id="user-1", context=AsyncMock())
+        tab = TabState(tab_id="tab-1", page=page, session=session)
+        session.tabs[tab.tab_id] = tab
+        window = ManagedWindow(
+            handle="window-1",
+            user_id=session.user_id,
+            tab=tab,
+            window_id="42",
+            kind="manual",
+        )
+        service.windows[window.handle] = window
+        service._window_handles_by_tab[(session.user_id, tab.tab_id)] = window.handle
+        monkeypatch.setattr("app.main.TAB_CLOSE_TIMEOUT_SECONDS", 0.01)
+
+        assert await service.close_managed_window(window.handle, session.user_id) is True
+        assert window.handle not in service.windows
+        assert tab.tab_id not in session.tabs
 
     asyncio.run(run())
 
