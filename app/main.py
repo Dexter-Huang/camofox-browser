@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict, TypeVar
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -30,8 +30,22 @@ from camoufox.async_api import AsyncCamoufox
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from playwright.async_api import Browser, BrowserContext, Locator, Page, Response as PwResponse
 
+from app.provider_automation import (
+    Citation,
+    NetworkAnswerListener,
+    answer_dom_baseline,
+    ProviderAutomationError,
+    ProviderName,
+    conversation_url,
+    keepalive as provider_keepalive,
+    prepare as prepare_provider,
+    rule_for,
+    submit as submit_provider,
+    wait_result,
+)
 from app.window_vnc import (
     WindowPublisher,
     read_x11_window_tree,
@@ -41,7 +55,7 @@ from app.window_vnc import (
 
 logger = logging.getLogger(__name__)
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 LOCATOR_TIMEOUT_MS = 3_000
 SUBMISSION_CLICK_TIMEOUT_MS = 12_000
 MAX_SELECTOR_LENGTH = 1_024
@@ -55,8 +69,9 @@ TAB_CREATE_TIMEOUT_SECONDS = 95
 VNC_DEFAULT_RESOLUTION = "1920x1080x24"
 WINDOW_PUBLISHER_WS_BASE_PORT = 6082
 WINDOW_PUBLISHER_RFB_OFFSET = 180
-MANUAL_WINDOW_RFB_PORT = 5901
-MANUAL_WINDOW_WS_PORT = 6081
+# 人工窗口包含独立 Firefox popup、x11vnc 与 WebSocket bridge；该限制必须和
+# GEO API 的 RPA_MANUAL_SESSION_MAX_CONCURRENT 使用同一部署值。
+MAX_MANUAL_WINDOWS = int(os.getenv("MAX_MANUAL_WINDOWS", "3"))
 MAX_TABS_PER_SESSION = int(os.getenv("MAX_TABS_PER_SESSION", "3"))
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", os.getenv("RPA_BROWSER_CAPACITY", "30")))
 MAX_TABS_GLOBAL = int(os.getenv("MAX_TABS_GLOBAL", os.getenv("RPA_BROWSER_CAPACITY", "30")))
@@ -80,7 +95,19 @@ MANUAL_KEYS = {
     "a", "c", "v", "x", "y", "z", "A", "C", "V", "X", "Y", "Z",
 }
 MODIFIERS = {"Alt", "Control", "Meta", "Shift"}
-CONTROLLED_RPA_ERROR_CODES = {"network_capture_active", "submission_not_dispatched"}
+CONTROLLED_RPA_ERROR_CODES = {
+    "provider_error",
+    "login_required",
+    "verification_required",
+    "page_unavailable",
+    "answer_timeout",
+    "execution_not_found",
+    "network_capture_active",
+    "submission_not_dispatched",
+    # 提交控件被平台对话框遮挡时，调用方必须保留账号会话等待人工处理，不能把
+    # Playwright 的页面细节泄露给应用层，更不能将一次未派发的提交自动重放。
+    "manual_intervention_required",
+}
 
 
 class ProtocolError(Exception):
@@ -158,6 +185,116 @@ class ManagedWindow:
     websocket_port: int | None = None
 
 
+ExecutionState = Literal["prepared", "submitting", "generating", "completed", "failed", "cancelled"]
+
+
+class AutomationResult(TypedDict, total=False):
+    """平台自动化可以安全返回给 SaaS 的标准结果。"""
+
+    citations: list[Citation]
+    conversationUrl: str
+
+
+class ExecutionResult(TypedDict):
+    answerMarkdown: str
+    result: AutomationResult
+
+
+class ExecutionError(TypedDict):
+    code: str
+    message: str
+
+
+def lower_camel_case(field_name: str) -> str:
+    """将 Python 内部 snake_case 字段稳定映射为协议使用的 lowerCamelCase。"""
+    first, *rest = field_name.split("_")
+    return first + "".join(part.capitalize() for part in rest)
+
+
+class V4Request(BaseModel):
+    """v4 仅接受声明过的任务级字段，拒绝任何浏览器细节字段。"""
+
+    # 统一在模型级生成协议别名，避免旧版 FastAPI 在字段级 alias 元数据上产生
+    # Pydantic 告警。Python 内部仍只使用清晰的 snake_case 名称。
+    model_config = ConfigDict(
+        alias_generator=lower_camel_case,
+        extra="forbid",
+        populate_by_name=True,
+        str_strip_whitespace=True,
+    )
+
+
+class ExecutionCreateRequest(V4Request):
+    """创建执行请求；字段均由后端调度生成，不能携带 URL 或 Selector。"""
+
+    execution_id: str = Field(min_length=1, max_length=256)
+    provider: ProviderName
+    profile_key: str = Field(min_length=1, max_length=256)
+    query: str = Field(min_length=1, max_length=20_000)
+    debug: bool = False
+
+
+class AccountRequest(V4Request):
+    """账号级高层操作的最小参数。"""
+
+    provider: ProviderName
+    profile_key: str = Field(min_length=1, max_length=256)
+
+
+class ProfileKeyRequest(V4Request):
+    """人工会话 checkpoint 和关闭操作只需隔离配置档键。"""
+
+    profile_key: str = Field(min_length=1, max_length=256)
+
+
+# 路由在运行时自行解析 request，避免 FastAPI 0.115 与新 Pydantic 的字段别名告警；
+# 同时显式复用模型 schema，保证运维仍可在 OpenAPI 中看到固定的 provider 枚举与字段边界。
+EXECUTION_CREATE_OPENAPI_SCHEMA = ExecutionCreateRequest.model_json_schema(
+    by_alias=True
+)
+
+
+class KeepalivePayload(TypedDict):
+    status: Literal["ok", "login_required", "verification_required", "uncertain"]
+
+
+class ManualSessionPayload(TypedDict):
+    sessionHandle: str
+    state: str
+
+
+class BooleanPayload(TypedDict):
+    ok: bool
+
+
+V4RequestModel = TypeVar("V4RequestModel", bound=V4Request)
+
+
+class ExecutionPayload(TypedDict, total=False):
+    executionId: str
+    state: ExecutionState
+    result: ExecutionResult
+    error: ExecutionError
+    failureScreenshotBase64: str
+
+
+@dataclass
+class Execution:
+    """不落库的单次任务执行；进程重启即丢失，后端必须保守收敛。"""
+
+    execution_id: str
+    provider: ProviderName
+    profile_key: str
+    query: str
+    tab: TabState
+    state: ExecutionState = "prepared"
+    result: ExecutionResult | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    failure_screenshot: bytes | None = None
+    task: asyncio.Task[None] | None = None
+
+
 class BrowserService:
     """隐藏 Camoufox 生命周期、账号隔离、StorageState 与受限网络采集的深模块。"""
 
@@ -184,13 +321,15 @@ class BrowserService:
         self._next_window_ws_port = bounded_port(
             "WINDOW_PUBLISHER_WS_BASE_PORT", WINDOW_PUBLISHER_WS_BASE_PORT
         )
+        self.executions: dict[str, Execution] = {}
+        self._execution_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        # A v3 sidecar must provide account-scoped native windows. Advertising a
+        # A v4 sidecar must provide account-scoped native windows. Advertising a
         # ready browser without the publisher would let the backend accept an
         # incomplete deployment, so keep readiness false until it is explicit.
         if not self.window_publisher_enabled:
-            logger.error("Window publisher must be enabled for GEO RPA protocol v3")
+            logger.error("Window publisher must be enabled for GEO RPA protocol v4")
             return
         # Dockerfile has already installed the pinned official Camoufox release
         # into this service account's package-manager cache.  Excluding the
@@ -246,7 +385,7 @@ class BrowserService:
 
     @property
     def protocol_version(self) -> int:
-        """Python sidecar 始终实现并声明 GEO RPA protocol v3。"""
+        """Python sidecar 始终实现并声明 GEO RPA protocol v4。"""
         return PROTOCOL_VERSION
 
     async def _idle_reaper(self) -> None:
@@ -269,8 +408,11 @@ class BrowserService:
                         continue
                     await self.close_tab(tab)
 
-                if not session.tabs:
-                    await self.close_session(user_id)
+                # 不能因为本轮保活或任务刚好关闭了最后一个 Tab，就立即关闭账号
+                # Context。后端可能正在为同一账号排队下一项保活/任务；立刻摘除
+                # session 会让已通过 session_for() 的并发请求在创建 Tab 时收到
+                # ``Session is closing``。空 Context 仍会在 SESSION_TIMEOUT_SECONDS
+                # 到期后统一回收，既保留账号隔离，也避免这一短暂竞争窗口。
 
     def _state_path(self, user_id: str) -> Path:
         digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:32]
@@ -295,18 +437,25 @@ class BrowserService:
             logger.warning("Invalid StorageState isolated")
             return None
 
-    async def _save_state(self, session: SessionState) -> None:
+    async def _save_state(self, session: SessionState) -> bool:
+        """将受限 StorageState 原子写回账号卷，返回本次 checkpoint 是否成功。"""
         path = self._state_path(session.user_id)
         try:
-            state = await session.context.storage_state(indexed_db=False)
+            # Kimi 等平台会把会话令牌写入 IndexedDB。只保存 Cookie/LocalStorage
+            # 会导致人工认证页面看似成功，但 Context 或 Firefox 进程退出后重新打开
+            # 又回到登录页。Playwright StorageState 支持该受限快照，仍不触及完整
+            # Firefox profile、浏览历史或浏览器扩展数据。
+            state = await session.context.storage_state(indexed_db=True)
             payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
             await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
             temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
             await asyncio.to_thread(temporary.write_text, payload, "utf-8")
             await asyncio.to_thread(temporary.replace, path)
-        except Exception:
+            return True
+        except Exception as exc:
             # 登录态内容绝不写入日志，checkpoint 失败也不能阻止 Context 正常关闭。
             logger.exception("StorageState checkpoint failed")
+            return False
 
     async def session_for(self, user_id: str) -> SessionState:
         if not user_id or len(user_id) > 256:
@@ -402,13 +551,6 @@ class BrowserService:
             self._camoufox = None
             self.browser = None
             await self.start()
-        async with session.lock:
-            await self._close_windows_for_user(user_id)
-            for tab in list(session.tabs.values()):
-                await self.close_tab(tab)
-            await self._save_state(session)
-            with suppress(Exception):
-                await session.context.close()
 
     async def create_tab(self, user_id: str, url: str) -> TabState:
         ensure_allowed_url(url)
@@ -467,8 +609,11 @@ class BrowserService:
             raise ProtocolError(409, "X11 window publisher is unavailable")
         tab = await self.owned_tab(user_id, tab_id)
         async with self._window_lock:
-            if kind == "manual" and any(window.kind == "manual" for window in self.windows.values()):
-                raise ProtocolError(409, "A manual window already exists")
+            manual_window_count = sum(
+                window.kind == "manual" for window in self.windows.values()
+            )
+            if kind == "manual" and manual_window_count >= MAX_MANUAL_WINDOWS:
+                raise ProtocolError(429, "Manual window capacity is exhausted")
             async with tab.session.lock:
                 async with tab.lock:
                     if tab.session.tabs.get(tab_id) is not tab:
@@ -551,6 +696,17 @@ class BrowserService:
         for handle in handles:
             await self.close_managed_window(handle, user_id)
 
+    async def close_all_manual_windows(self) -> int:
+        """回收无 API 所有者的人工窗口，供应用重启后的受控恢复使用。"""
+        windows = [
+            (handle, window.user_id)
+            for handle, window in self.windows.items()
+            if window.kind == "manual"
+        ]
+        for handle, user_id in windows:
+            await self.close_managed_window(handle, user_id)
+        return len(windows)
+
     async def close_managed_window(self, handle: str, user_id: str) -> bool:
         """幂等结束窗口租约，先撤销 publisher 再关闭该账号 popup。"""
         async with self._window_lock:
@@ -568,8 +724,12 @@ class BrowserService:
                 await window.tab.page.close()
         return True
 
-    def _next_task_window_ports(self) -> tuple[int, int]:
-        """为观察器分配容器内唯一端口对；端口永不返回给浏览器前端。"""
+    def _next_window_ports(self) -> tuple[int, int]:
+        """为单个账号窗口分配容器内唯一端口对。
+
+        人工认证与任务观察共用这一分配器，保证不同账号绝不会复用同一 RFB 或
+        WebSocket 上游；端口只返回给应用后端代理，绝不进入浏览器前端。
+        """
         websocket_port = self._next_window_ws_port
         rfb_port = websocket_port - WINDOW_PUBLISHER_RFB_OFFSET
         if not 1024 <= rfb_port <= 65535 or websocket_port > 65535:
@@ -589,11 +749,7 @@ class BrowserService:
                 await window.publisher.stop()
                 window.publisher = None
                 window.websocket_port = None
-            if window.kind == "manual":
-                rfb_port = bounded_port("MANUAL_WINDOW_RFB_PORT", MANUAL_WINDOW_RFB_PORT)
-                websocket_port = bounded_port("MANUAL_WINDOW_WS_PORT", MANUAL_WINDOW_WS_PORT)
-            else:
-                rfb_port, websocket_port = self._next_task_window_ports()
+            rfb_port, websocket_port = self._next_window_ports()
             publisher = WindowPublisher(
                 display=self.x11_display,
                 window_id=window.window_id,
@@ -653,6 +809,206 @@ class BrowserService:
             with suppress(Exception):
                 await tab.page.close()
 
+    async def create_execution(
+        self, execution_id: str, provider: ProviderName, profile_key: str, query: str
+    ) -> Execution:
+        """创建并填写任务页；未调用 submit 前不会向第三方平台派发问题。"""
+        if not execution_id or len(execution_id) > 256 or not profile_key or len(profile_key) > 256:
+            raise ProtocolError(400, "executionId and profileKey are required")
+        try:
+            rule = rule_for(provider)
+        except ProviderAutomationError as exc:
+            raise ProtocolError(400, "Unsupported RPA provider", exc.code) from exc
+        # executionId 由后端任务尝试生成。这里先建立内存登记再进行任何页面动作，
+        # 使客户端在创建请求超时后可安全重试，并避免并发请求各自打开一张任务页。
+        async with self._execution_lock:
+            existing = self.executions.get(execution_id)
+            if existing is not None:
+                if existing.provider != provider or existing.profile_key != profile_key or existing.query != query:
+                    raise ProtocolError(409, "executionId is already bound to another request")
+                return existing
+            tab = await self.create_tab(profile_key, rule.entry_url)
+            execution = Execution(execution_id, provider, profile_key, query, tab)
+            self.executions[execution_id] = execution
+        try:
+            # prepare 仅写入输入框，不触发提交。后端须在下一阶段将 promptSubmitted
+            # 落库；这把浏览器副作用与 SaaS 持久化事务明确切开。
+            async with tab.lock:
+                await prepare_provider(tab.page, rule, query)
+            return execution
+        except ProviderAutomationError as exc:
+            execution.state, execution.error_code, execution.error_message = "failed", exc.code, str(exc)
+            with suppress(Exception):
+                execution.failure_screenshot = await tab.page.screenshot(type="png")
+            await self.close_tab(tab)
+            raise ProtocolError(409, "Provider execution could not be prepared", exc.code) from exc
+        except Exception as exc:
+            # 仅记录平台标识和堆栈，绝不把 query、profileKey、Cookie 或页面正文写入日志。
+            # 未分类异常仍对后端收敛成稳定错误码，运维则可据此修复 Camofox 内的平台规则。
+            logger.exception("Provider execution preparation failed: provider=%s", provider.value)
+            execution.state, execution.error_code, execution.error_message = "failed", "page_unavailable", "Provider page is unavailable"
+            with suppress(Exception):
+                execution.failure_screenshot = await tab.page.screenshot(type="png")
+            await self.close_tab(tab)
+            raise ProtocolError(503, "Provider execution could not be prepared") from exc
+
+    async def submit_execution(self, execution_id: str) -> Execution:
+        """幂等开始执行。重复请求只返回同一执行状态，绝不再次点击提交。"""
+        execution = self.executions.get(execution_id)
+        if execution is None:
+            raise ProtocolError(404, "Execution not found", "execution_not_found")
+        if execution.state == "prepared":
+            # 仅 prepared 可创建后台协程；submitting/generating 的重复 submit 返回同一
+            # 对象，completed/failed/cancelled 也不会被重新激活。
+            execution.state = "submitting"
+            execution.task = asyncio.create_task(self._run_execution(execution), name=f"rpa-{execution_id}")
+        return execution
+
+    async def _run_execution(self, execution: Execution) -> None:
+        rule = rule_for(execution.provider)
+        listener: NetworkAnswerListener | None = None
+        try:
+            async with execution.tab.lock:
+                # 网络监听器在提交前绑定到 execution 独占页面。它只能命中
+                # ProviderRule 中的静态聊天接口，不读取 DOM 回答，避免网站导航、
+                # 工作台、思考步骤或历史会话文字污染 Markdown。
+                listener = NetworkAnswerListener(execution.tab.page, rule)
+                await listener.arm()
+                # DOM 只作为网络流无终态时的兜底基线。它不参与正常网络结果的
+                # Markdown 或引用合并，避免将工作台、导航和搜索状态写入结果。
+                baseline_count = await answer_dom_baseline(execution.tab.page, rule)
+                await submit_provider(execution.tab.page, rule)
+                execution.state = "generating"
+                try:
+                    network_answer = await listener.wait_result()
+                    answer_markdown = network_answer.markdown
+                    citations = network_answer.citations
+                except ProviderAutomationError as network_error:
+                    if network_error.code not in {"answer_timeout", "answer_incomplete"}:
+                        raise
+                    # 平台 SSE 长连接未关闭或协议短暂改版时，才使用同一 execution
+                    # 新增的回答卡片。绝不因兜底重新提交问题或读取整页文本。
+                    answer_markdown, citations = await wait_result(
+                        execution.tab.page,
+                        rule,
+                        baseline_count=baseline_count,
+                        submitted_query=execution.query,
+                    )
+                result: AutomationResult = {"citations": citations}
+                confirmed = conversation_url(rule, execution.tab.page.url)
+                if confirmed is not None:
+                    result["conversationUrl"] = confirmed
+                execution.result = {"answerMarkdown": answer_markdown, "result": result}
+                execution.state = "completed"
+        except asyncio.CancelledError:
+            execution.state = "cancelled"
+            raise
+        except ProviderAutomationError as exc:
+            execution.state, execution.error_code, execution.error_message = "failed", exc.code, str(exc)
+            with suppress(Exception):
+                execution.failure_screenshot = await execution.tab.page.screenshot(type="png")
+        except Exception:
+            execution.state, execution.error_code, execution.error_message = "failed", "page_unavailable", "Provider execution failed"
+            with suppress(Exception):
+                execution.failure_screenshot = await execution.tab.page.screenshot(type="png")
+        finally:
+            if listener is not None:
+                await listener.close()
+            # 无论成功、取消还是失败都立即 checkpoint 并关闭任务 Tab。StorageState 留在
+            # sidecar 的受限卷内，执行结果和失败证据则由后端拉取后按其保留期持久化。
+            # sidecar 重启会丢失 execution registry；后端看到 execution_not_found 时必须
+            # 把已提交任务收敛为不确定状态，绝不可重新提交。
+            await self._save_state(execution.tab.session)
+            await self.close_tab(execution.tab)
+
+    async def capture_execution_preview(self, execution_id: str) -> bytes:
+        """返回执行中的完整 PNG，不允许按账号、Tab 或页面规则读取。
+
+        预览严格绑定后端生成的 ``executionId``，仅在任务准备、提交或生成期间可用。
+        任务终态后会关闭 Tab，因此此接口不是历史页面重放通道，也不会把平台页面内容
+        写入 sidecar 的持久化卷。
+        """
+        execution = self.executions.get(execution_id)
+        if execution is None:
+            raise ProtocolError(404, "Execution not found", "execution_not_found")
+        if execution.state not in {"prepared", "submitting", "generating"}:
+            raise ProtocolError(
+                409, "Execution preview is unavailable", "execution_preview_unavailable"
+            )
+        try:
+            # 执行协程在等待网络流结束时保持页面静止；这里仅触发 Playwright 的只读
+            # 截图，不修改 DOM、网络 API 或用户会话。不能等待 tab 锁，否则长流会使
+            # 前端预览始终阻塞到任务结束。
+            return await execution.tab.page.screenshot(type="png", full_page=True)
+        except Exception as exc:
+            raise ProtocolError(
+                409,
+                "Execution page is not ready for preview",
+                "execution_preview_pending",
+            ) from exc
+
+    def execution_payload(self, execution: Execution) -> ExecutionPayload:
+        payload: ExecutionPayload = {"executionId": execution.execution_id, "state": execution.state}
+        if execution.result is not None:
+            payload["result"] = execution.result
+        if execution.error_code is not None:
+            payload["error"] = {"code": execution.error_code, "message": execution.error_message or "Provider execution failed"}
+        if execution.failure_screenshot is not None:
+            payload["failureScreenshotBase64"] = base64.b64encode(execution.failure_screenshot).decode("ascii")
+        return payload
+
+    async def cancel_execution(self, execution_id: str) -> Execution:
+        execution = self.executions.get(execution_id)
+        if execution is None:
+            raise ProtocolError(404, "Execution not found", "execution_not_found")
+        if execution.task is not None and not execution.task.done():
+            execution.task.cancel()
+            await asyncio.gather(execution.task, return_exceptions=True)
+        elif execution.state == "prepared":
+            execution.state = "cancelled"
+            await self.close_tab(execution.tab)
+        return execution
+
+    async def account_keepalive(
+        self, provider: ProviderName, profile_key: str
+    ) -> Literal["ok", "login_required", "verification_required", "uncertain"]:
+        """平台规则在 sidecar 内执行，后端只接收稳定账号状态。"""
+        try:
+            rule = rule_for(provider)
+        except ProviderAutomationError as exc:
+            raise ProtocolError(400, "Unsupported RPA provider", exc.code) from exc
+        # 保活使用独立临时 Tab，不能复用正在执行或人工认证的页面；账号 Context 仍由
+        # profileKey 隔离，避免 Cookie、IndexedDB 与 LocalStorage 跨账号串用。
+        tab = await self.create_tab(profile_key, rule.entry_url)
+        try:
+            async with tab.lock:
+                return await provider_keepalive(tab.page, rule)
+        finally:
+            await self._save_state(tab.session)
+            await self.close_tab(tab)
+
+    async def create_manual_session(
+        self, provider: ProviderName, profile_key: str
+    ) -> ManagedWindow:
+        """按平台规则打开认证入口并返回不透明人工会话句柄。"""
+        try:
+            rule = rule_for(provider)
+        except ProviderAutomationError as exc:
+            raise ProtocolError(400, "Unsupported RPA provider", exc.code) from exc
+        tab = await self.create_tab(profile_key, rule.entry_url)
+        try:
+            window = await self.promote_tab_to_window(profile_key, tab.tab_id, kind="manual")
+            return await self.publish_window(window.handle, profile_key)
+        except Exception:
+            await self.close_tab(tab)
+            raise
+
+    async def checkpoint_manual_session(self, handle: str, profile_key: str) -> bool:
+        window = self.windows.get(handle)
+        if window is None or window.user_id != profile_key or window.kind != "manual":
+            raise ProtocolError(404, "Manual session not found")
+        return await self._save_state(window.tab.session)
+
     async def _on_response(self, tab: TabState, response: PwResponse) -> None:
         for capture in list(tab.captures.values()):
             if capture.state != "waiting" or not capture.armed or not response_matches(response, capture.spec):
@@ -664,6 +1020,14 @@ class BrowserService:
             capture.status = response.status
             capture.content_type = response.headers.get("content-type", "")
             try:
+                # Kimi 的会话健康 RPC 只需要受保护接口的 HTTP 状态。maxBytes=0
+                # 是明确的“状态专用”语义：不读取、缓存或回传该响应正文，避免把
+                # 订阅信息等页面数据越过最小化采集边界。
+                if capture.spec["maxBytes"] == 0:
+                    if capture.generation == generation:
+                        capture.body = b""
+                        capture.state = "complete"
+                    continue
                 body = await response.body()
                 if len(body) > capture.spec["maxBytes"]:
                     raise ValueError("response body exceeded byte limit")
@@ -737,6 +1101,18 @@ async def request_object(request: Request) -> dict[str, Any]:
     return body
 
 
+async def parse_v4_request(
+    request: Request, model: type[V4RequestModel]
+) -> V4RequestModel:
+    """在协议边界解析 v4 JSON，并由 Pydantic 拒绝未声明的浏览器控制字段。"""
+    raw = await request_object(request)
+    try:
+        return model.model_validate(raw)
+    except ValidationError as exc:
+        # 校验详情可能回显请求字段或值；对外只返回稳定的受控错误文本。
+        raise ProtocolError(400, "Request parameters are invalid") from exc
+
+
 @asynccontextmanager
 async def tab_operation(user_id: str, tab_id: str) -> AsyncIterator[TabState]:
     """按账号锁、Tab 锁的固定顺序执行一次 RPA 操作。
@@ -801,7 +1177,9 @@ def normalize_spec(raw: Any) -> dict[str, Any]:
     maximum = raw.get("maxBytes", MAX_CAPTURE_BYTES)
     if not method.isalpha() or not host or not path.startswith("/") or (prefix and not prefix.startswith("/")):
         raise ProtocolError(400, "capture spec method, host, and path are required")
-    if not isinstance(maximum, int) or isinstance(maximum, bool) or not 0 < maximum <= MAX_CAPTURE_BYTES:
+    # 0 是状态专用 capture：允许确认登录态，但禁止读取响应正文。正值才是
+    # 可回传正文的字节上限；负数、布尔值和过大的值保持拒绝。
+    if not isinstance(maximum, int) or isinstance(maximum, bool) or not 0 <= maximum <= MAX_CAPTURE_BYTES:
         raise ProtocolError(400, "capture spec maxBytes is invalid")
     return {"method": method, "host": host, "path": path.rstrip("/") or "/", "pathPrefix": prefix or None, "maxBytes": maximum, "activateOnSubmit": raw.get("activateOnSubmit") is True}
 
@@ -842,7 +1220,19 @@ async def submit_near(tab: TabState, target: Any) -> None:
     if selected is None:
         raise ProtocolError(400, "input-adjacent submit control not found")
     arm_submit_captures(tab)
-    await selected.click(timeout=SUBMISSION_CLICK_TIMEOUT_MS, no_wait_after=True)
+    try:
+        await selected.click(timeout=SUBMISSION_CLICK_TIMEOUT_MS, no_wait_after=True)
+    except Exception as exc:
+        # 豆包会不定期显示全屏平台对话框。此时发送按钮虽仍满足可见/可用条件，
+        # 但浏览器明确证明点击被弹窗树拦截，提交未派发。该状态需要人工确认，
+        # 不能将页面内部元素、标题或堆栈传出，也不能由自动恢复再次点击。
+        if "intercepts pointer events" in str(exc):
+            raise ProtocolError(
+                409,
+                "A platform dialog is blocking submission and needs manual handling",
+                "manual_intervention_required",
+            ) from exc
+        raise
 
 
 @app.get("/health")
@@ -862,7 +1252,135 @@ async def health() -> dict[str, Any]:
         "consecutiveFailures": 0,
         "vncEnabled": service.vnc_enabled,
         "windowPublisherEnabled": service.window_publisher_enabled,
+        "capabilities": ["task_executions", "account_keepalive", "manual_windows"],
     }
+
+
+@app.post(
+    "/rpa/executions",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {"schema": EXECUTION_CREATE_OPENAPI_SCHEMA}
+            },
+        }
+    },
+)
+async def create_execution(request: Request) -> ExecutionPayload:
+    """创建平台任务并填写问题；不接受 URL、selector 或网络捕获声明。"""
+    try:
+        body = await parse_v4_request(request, ExecutionCreateRequest)
+        # 请求体刻意没有 url、selector、headers、cookie 或脚本字段。平台变化只能通过
+        # Camofox 镜像中的受审查 Python 规则修复，不能在生产后端临时拼装浏览器操作。
+        execution = await service.create_execution(
+            body.execution_id,
+            body.provider,
+            body.profile_key,
+            body.query,
+        )
+        return service.execution_payload(execution)
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
+
+
+@app.post("/rpa/executions/{execution_id}/submit", status_code=202)
+async def submit_execution(execution_id: str) -> ExecutionPayload:
+    """幂等地开始已经准备好的任务，不允许调用方指定提交元素。"""
+    try:
+        return service.execution_payload(await service.submit_execution(execution_id))
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
+
+
+@app.get("/rpa/executions/{execution_id}")
+async def execution_status(execution_id: str) -> ExecutionPayload:
+    execution = service.executions.get(execution_id)
+    if execution is None:
+        raise error_response(ProtocolError(404, "Execution not found", "execution_not_found"))
+    return service.execution_payload(execution)
+
+
+@app.get("/rpa/executions/{execution_id}/preview")
+async def execution_preview(execution_id: str) -> Response:
+    """读取执行中页面的单张 PNG，供已鉴权的后端任务观察接口转发。"""
+    try:
+        image = await service.capture_execution_preview(execution_id)
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
+    return Response(
+        image,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
+@app.delete("/rpa/executions/{execution_id}")
+async def cancel_execution(execution_id: str) -> ExecutionPayload:
+    try:
+        return service.execution_payload(await service.cancel_execution(execution_id))
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
+
+
+@app.post("/rpa/accounts/keepalive")
+async def account_keepalive(request: Request) -> KeepalivePayload:
+    """执行平台无关的账号保活，页面规则完全由 sidecar 决定。"""
+    try:
+        body = await parse_v4_request(request, AccountRequest)
+        return {
+            "status": await service.account_keepalive(
+                body.provider,
+                body.profile_key,
+            )
+        }
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
+
+
+@app.post("/rpa/manual-sessions")
+async def create_manual_session(request: Request) -> ManualSessionPayload:
+    """按 provider 创建人工认证窗口；调用方不能指定认证地址或 tab。"""
+    try:
+        body = await parse_v4_request(request, AccountRequest)
+        window = await service.create_manual_session(
+            body.provider,
+            body.profile_key,
+        )
+        return {"sessionHandle": window.handle, "state": window.state}
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
+
+
+@app.get("/rpa/manual-sessions/{handle}")
+async def manual_session_status(handle: str, profileKey: str) -> dict[str, str]:
+    window = service.windows.get(handle)
+    if window is None or window.user_id != profileKey or window.kind != "manual" or window.tab.page.is_closed():
+        raise error_response(ProtocolError(404, "Manual session not found"))
+    return {"state": window.state}
+
+
+@app.post("/rpa/manual-sessions/{handle}/checkpoint")
+async def checkpoint_manual_session(handle: str, request: Request) -> BooleanPayload:
+    try:
+        body = await parse_v4_request(request, ProfileKeyRequest)
+        persisted = await service.checkpoint_manual_session(
+            handle, body.profile_key
+        )
+        if not persisted:
+            raise ProtocolError(503, "Camofox Browser could not persist the authenticated session")
+        return {"ok": True}
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
+
+
+@app.delete("/rpa/manual-sessions/{handle}")
+async def delete_manual_session(handle: str, request: Request) -> BooleanPayload:
+    try:
+        body = await parse_v4_request(request, ProfileKeyRequest)
+        return {"ok": await service.close_managed_window(handle, body.profile_key)}
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
 
 
 @app.get("/vnc/status")
@@ -952,6 +1470,23 @@ async def delete_manual_window(handle: str, request: Request) -> Response:
             raise ProtocolError(404, "Manual window not found")
         await service.close_managed_window(handle, user_id)
         return Response(status_code=204)
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
+
+
+@app.post("/rpa/manual-windows/{handle}/vnc")
+async def open_manual_window_vnc(handle: str, request: Request) -> dict[str, int | str]:
+    """按需发布一个人工窗口；端口只交给 GEO 后端的内网代理。"""
+    body = await request_object(request)
+    try:
+        user_id = require_string(body.get("userId"), "userId", 256)
+        window = service.windows.get(handle)
+        if window is None or window.user_id != user_id or window.kind != "manual":
+            raise ProtocolError(404, "Manual window not found")
+        window = await service.publish_window(handle, user_id)
+        if window.websocket_port is None:
+            raise ProtocolError(409, "Manual VNC is unavailable")
+        return {"state": window.state, "websocketPort": window.websocket_port}
     except ProtocolError as exc:
         raise error_response(exc) from exc
 
@@ -1071,6 +1606,27 @@ async def create_capture(tab_id: str, request: Request) -> dict[str, str]:
         raise error_response(exc) from exc
 
 
+@app.delete("/rpa/manual-windows")
+async def delete_orphaned_manual_windows() -> dict[str, int]:
+    """关闭所有人工窗口；该内部端点只供单一 GEO API 实例恢复重启遗留资源。"""
+    return {"closed": await service.close_all_manual_windows()}
+
+
+@app.post("/rpa/tabs/{tab_id}/checkpoint")
+async def checkpoint(tab_id: str, request: Request) -> dict[str, bool]:
+    """在人工认证完成时先持久化当前账号 Context，随后才允许调用方关闭窗口。"""
+    body = await request_object(request)
+    try:
+        async with tab_operation(require_string(body.get("userId"), "userId", 256), tab_id) as tab:
+            # 手工登录完成不能只依赖后续的空闲回收或 Context close。此处同步写回，
+            # 让认证接口在卷不可写、快照失败时明确失败，而不是误报认证成功。
+            if not await service._save_state(tab.session):
+                raise ProtocolError(503, "Camofox Browser could not persist the authenticated session")
+        return {"ok": True}
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
+
+
 @app.get("/rpa/tabs/{tab_id}/network-captures/{capture_id}")
 async def capture_status(tab_id: str, capture_id: str, userId: str) -> Response:
     try:
@@ -1117,8 +1673,10 @@ async def delete_capture(tab_id: str, capture_id: str, request: Request) -> dict
         raise error_response(exc) from exc
 
 
+@app.get("/tabs/{tab_id}/current-url")
 @app.get("/rpa/tabs/{tab_id}/current-url")
 async def current_url(tab_id: str, userId: str) -> dict[str, str]:
+    """返回账号归属 Tab 的自然地址，不接受导航、脚本或任意页面读取参数。"""
     try:
         async with tab_operation(userId, tab_id) as tab:
             return {"url": tab.page.url}
@@ -1193,13 +1751,24 @@ async def locator_read(tab_id: str, request: Request) -> dict[str, Any]:
     try:
         async with tab_operation(require_string(body.get("userId"), "userId", 256), tab_id) as tab:
             operation = body.get("operation")
-            locator = target_locator(tab, body.get("target"))
+            target = body.get("target")
+            locator = target_locator(tab, target)
             count = await locator.count()
             soft = {"visible", "enabled", "editable", "has_value_property", "content_editable"}
             if operation == "count":
                 return {"ok": True, "result": count}
             if count == 0 and operation in soft:
                 return {"ok": True, "result": False}
+            if (
+                count == 0
+                and operation == "inner_text"
+                and isinstance(target, dict)
+                and target.get("selector") == "body"
+            ):
+                # task window 刚创建时 Firefox 可能尚未建立 document.body。它不是
+                # locator 协议错误，也不表示账号 tab 已关闭；返回空文本让调用方继续
+                # 按自身的页面就绪条件轮询。其他 selector 仍保留严格的缺失语义。
+                return {"ok": True, "result": ""}
             locator = await visible_locator(tab, body.get("target"))
             if operation == "visible": result = await locator.is_visible(timeout=LOCATOR_TIMEOUT_MS)
             elif operation == "enabled": result = await locator.is_enabled(timeout=LOCATOR_TIMEOUT_MS)
@@ -1273,6 +1842,7 @@ async def locator_screenshot(tab_id: str, request: Request) -> Response:
 
 @app.post("/rpa/tabs/{tab_id}/locator-focus")
 @app.post("/rpa/tabs/{tab_id}/locator-key")
+@app.post("/rpa/tabs/{tab_id}/locator-clear")
 @app.post("/rpa/tabs/{tab_id}/locator-input")
 @app.post("/rpa/tabs/{tab_id}/locator-click")
 @app.post("/rpa/tabs/{tab_id}/locator-submit")
@@ -1289,8 +1859,29 @@ async def locator_action(tab_id: str, request: Request) -> dict[str, bool]:
                 elif action == "locator-key":
                     if body.get("key") != "Enter": raise ProtocolError(400, "locator key is not allowed")
                     await locator.press("Enter", timeout=LOCATOR_TIMEOUT_MS)
+                elif action == "locator-clear":
+                    atomic = body.get("atomic", False)
+                    if not isinstance(atomic, bool):
+                        raise ProtocolError(400, "locator clear atomic is invalid")
+                    # Playwright 的 Locator.fill 空值同时支持 input、textarea 和
+                    # contenteditable，并由浏览器派发站点框架可识别的编辑事件。清空
+                    # 必须保持在声明的 Locator 内，不能退化为页面全局快捷键。
+                    await locator.fill("", timeout=LOCATOR_TIMEOUT_MS)
                 elif action == "locator-input":
                     text = require_string(body.get("text"), "locator input text", 4_096)
+                    atomic = body.get("atomic", False)
+                    native_contenteditable_events = body.get("nativeContenteditableEvents", False)
+                    if not isinstance(atomic, bool):
+                        raise ProtocolError(400, "locator input atomic is invalid")
+                    if not isinstance(native_contenteditable_events, bool):
+                        raise ProtocolError(400, "locator input nativeContenteditableEvents is invalid")
+                    if native_contenteditable_events:
+                        # 该路径只服务于已经由工作流声明的 contenteditable。使用
+                        # Playwright 的 Locator 键盘事件，不注入 JavaScript，也不伪造
+                        # isTrusted；这样 React 能接到与用户编辑一致的输入事件链。
+                        if not await locator.evaluate("node => node.isContentEditable"):
+                            raise ProtocolError(400, "native contenteditable input requires a contenteditable locator")
+                        await locator.focus(timeout=LOCATOR_TIMEOUT_MS)
                     await locator.press_sequentially(text, delay=0, timeout=LOCATOR_TIMEOUT_MS)
                 elif action == "locator-click":
                     try:

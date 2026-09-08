@@ -1,6 +1,6 @@
 # GEO Python Camoufox Sidecar
 
-This submodule implements GEO RPA protocol v3 with FastAPI/Uvicorn on
+This submodule implements GEO RPA protocol v4 with FastAPI/Uvicorn on
 `camofox-browser:9377`. It uses `camoufox==0.5.5` and `playwright==1.59.0` to
 control the fixed Camoufox 152.0.4-beta.29 release.
 
@@ -10,10 +10,12 @@ cookie export, arbitrary request headers, or a general browser debugging API.
 
 ## Protocol and isolation
 
-`/health` always declares `geoRpaProtocolVersion=3`. Per-account state is
-stored only as `sha256(userId)[:32]/storage-state.json`; complete Firefox
-profiles, Chromium/Sandbox cookies, and IndexedDB are never imported or
-exported.
+`/health` always declares `geoRpaProtocolVersion=4`. Per-account state is
+stored only as `sha256(userId)[:32]/storage-state.json`. The controlled
+Playwright StorageState snapshot includes cookies, local storage, and
+IndexedDB so providers whose login token lives in IndexedDB survive a Context
+or Firefox restart. Complete Firefox profiles and Chromium/Sandbox cookies
+are never imported or exported.
 
 Closing a session first removes it from the public session map and installs one
 awaitable closing barrier for that user. New sessions wait for the barrier. A
@@ -21,10 +23,37 @@ Context close timeout restarts the controlled browser and removes all stale
 Context indexes, preventing late pages from becoming ghost tabs or writing to
 the previous profile.
 
+Manual authentication calls the controlled
+`POST /rpa/tabs/{tab_id}/checkpoint` route before its window is closed. The
+route synchronously writes the same IndexedDB-inclusive StorageState and
+returns an error if that write fails; an authentication UI must not report
+success merely because the page remains visibly logged in.
+
 Set `ENABLE_WINDOW_PUBLISHER=true` to enable account-scoped X11 window
 publication. Without it, `/health` remains `browserReady=false`, so the
-backend cannot accept an incomplete v3 deployment. A shared desktop is never
+backend cannot accept an incomplete v4 deployment. A shared desktop is never
 presented as an account-scoped observer.
+
+Each manual authentication window is published through its own internal
+`x11vnc` and WebSocket bridge. `MAX_MANUAL_WINDOWS` bounds concurrent manual
+windows (the Compose default is 3 and is derived from
+`RPA_MANUAL_SESSION_MAX_CONCURRENT`); the browser client only connects to the
+GEO application's authenticated same-origin proxy and never receives a bridge
+port or X11 window identifier.
+
+## Authorized interaction pacing
+
+Provider automation owns the reviewed DOM interaction rules for all six
+platforms. `InteractionPacingPolicy` uses fixed hover/focus settling, bounded
+keyboard chunks, and a pre-submit wait so rich-text editors can process each
+input phase reliably. For authorized automated tasks, the native browser mouse
+moves in a fixed number of steps only to the center of an already-located,
+visible input or submit control; the backend cannot supply coordinates.
+
+The sidecar does not change browser fingerprints, network location, account
+identity, or CAPTCHA behavior. Login, verification, restrictions, and blocking
+dialogs return stable outcomes for human handling rather than being retried or
+bypassed.
 
 ## Local development
 

@@ -21,7 +21,7 @@ docker build -t geo-camofox-browser:local .
 
 - 对外只提供 `app/main.py` 中 GEO RPA protocol v3 所需的受限 HTTP 路由。
 - 不提供任意 JavaScript 执行、任意 URL/cookie/header、通用调试协议或 MCP 入口。
-- 账号状态仅使用 `sha256(userId)[:32]/storage-state.json`；不得导入或导出完整浏览器 profile、Sandbox cookie 或 IndexedDB。
+- 账号状态仅使用 `sha256(userId)[:32]/storage-state.json`；该受限 Playwright StorageState 快照包含 Cookie、LocalStorage 与 IndexedDB，以保留平台登录令牌。不得导入或导出完整浏览器 profile、Sandbox/Chromium cookie。
 - `ENABLE_WINDOW_PUBLISHER=true` 时才发布账号级 X11 窗口；共享桌面不能作为账号观察器暴露。
 - 关闭会话必须等待 teardown barrier，超时必须清理 Context 索引并重启受控浏览器。
 
