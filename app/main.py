@@ -82,6 +82,12 @@ MANUAL_WINDOW_PAINT_SETTLE_SECONDS = 0.35
 # 使用毫秒，这里限制为约 25fps，降低长期人工认证对后台 Tab 绘制和编码的抢占。
 MANUAL_WINDOW_VNC_CAPTURE_WAIT_MS = 40
 MANUAL_WINDOW_VNC_CAPTURE_DEFER_MS = 40
+# 创建 Context、导航、生成原生 popup 和发现 X11 window id 都会在短时间内占用
+# 单 Firefox/Xvfb 的主线程与合成资源。这里只限制初始化并发；窗口发布完成后立即
+# 释放槽位，不限制后续同时在线和操作的人工 VNC 数量。
+MANUAL_WINDOW_CREATE_CONCURRENCY = max(
+    1, min(8, int(os.getenv("MANUAL_WINDOW_CREATE_CONCURRENCY", "2")))
+)
 # 人工窗口包含独立 Firefox popup、x11vnc 与 WebSocket bridge；该限制必须和
 # GEO API 的 RPA_MANUAL_SESSION_MAX_CONCURRENT 使用同一部署值。
 # 0 表示不设置人工窗口硬上限；正整数时必须与 GEO API 的部署配置一致。
@@ -394,6 +400,9 @@ class BrowserService:
         self.windows: dict[str, ManagedWindow] = {}
         self._window_handles_by_tab: dict[tuple[str, str], str] = {}
         self._window_lock = asyncio.Lock()
+        self._manual_window_create_semaphore = asyncio.Semaphore(
+            MANUAL_WINDOW_CREATE_CONCURRENCY
+        )
         self._next_window_rfb_port = bounded_port(
             "WINDOW_PUBLISHER_RFB_BASE_PORT", WINDOW_PUBLISHER_RFB_BASE_PORT
         )
@@ -1275,18 +1284,25 @@ class BrowserService:
     async def create_manual_session(
         self, provider: ProviderName, profile_key: str
     ) -> ManagedWindow:
-        """按平台规则打开认证入口并返回不透明人工会话句柄。"""
+        """按平台规则排队创建认证窗口，并返回不透明人工会话句柄。
+
+        信号量只覆盖窗口初始化阶段。发布完成的窗口不会继续占用创建槽位，因此
+        在线人工 VNC 数量仍由 ``MAX_MANUAL_WINDOWS`` 独立控制。
+        """
         try:
             rule = rule_for(provider)
         except ProviderAutomationError as exc:
             raise ProtocolError(400, "Unsupported RPA provider", exc.code) from exc
-        tab = await self.create_tab(profile_key, rule.entry_url)
-        try:
-            window = await self.promote_tab_to_window(profile_key, tab.tab_id, kind="manual")
-            return await self.publish_window(window.handle, profile_key)
-        except Exception:
-            await self.close_tab(tab)
-            raise
+        async with self._manual_window_create_semaphore:
+            tab = await self.create_tab(profile_key, rule.entry_url)
+            try:
+                window = await self.promote_tab_to_window(
+                    profile_key, tab.tab_id, kind="manual"
+                )
+                return await self.publish_window(window.handle, profile_key)
+            except Exception:
+                await self.close_tab(tab)
+                raise
 
     async def checkpoint_manual_session(self, handle: str, profile_key: str) -> bool:
         window = self.windows.get(handle)

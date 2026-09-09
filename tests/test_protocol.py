@@ -1292,6 +1292,60 @@ def test_manual_window_paint_gate_runs_before_window_publisher_start(
     asyncio.run(run())
 
 
+def test_manual_window_creation_is_bounded_without_limiting_online_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """初始化峰值受闸门约束，已发布窗口不会占用后续请求的创建槽位。"""
+
+    async def run() -> None:
+        monkeypatch.setattr("app.main.MANUAL_WINDOW_CREATE_CONCURRENCY", 2)
+        instance = BrowserService()
+        active_creations = 0
+        peak_creations = 0
+        first_wave_ready = asyncio.Event()
+        release_first_wave = asyncio.Event()
+
+        async def create_tab(profile_key: str, _: str) -> Mock:
+            nonlocal active_creations, peak_creations
+            active_creations += 1
+            peak_creations = max(peak_creations, active_creations)
+            if active_creations == 2:
+                first_wave_ready.set()
+            await release_first_wave.wait()
+            active_creations -= 1
+            return Mock(tab_id=f"tab-{profile_key}")
+
+        async def promote(profile_key: str, _: str, *, kind: str) -> Mock:
+            assert kind == "manual"
+            return Mock(handle=f"window-{profile_key}")
+
+        async def publish(handle: str, _: str) -> Mock:
+            return Mock(handle=handle, state="published")
+
+        monkeypatch.setattr(instance, "create_tab", create_tab)
+        monkeypatch.setattr(instance, "promote_tab_to_window", promote)
+        monkeypatch.setattr(instance, "publish_window", publish)
+
+        tasks = [
+            asyncio.create_task(
+                instance.create_manual_session(
+                    ProviderName.DEEPSEEK, f"profile-{index}"
+                )
+            )
+            for index in range(5)
+        ]
+        await asyncio.wait_for(first_wave_ready.wait(), timeout=1)
+        assert sum(task.done() for task in tasks) == 0
+        release_first_wave.set()
+        windows = await asyncio.gather(*tasks)
+
+        assert peak_creations == 2
+        assert len(windows) == 5
+        assert all(window.state == "published" for window in windows)
+
+    asyncio.run(run())
+
+
 def test_v4_sidecar_is_not_ready_without_the_window_publisher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
