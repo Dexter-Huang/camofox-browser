@@ -157,30 +157,59 @@ def bounded_port(name: str, default: int) -> int:
     return value if 1 <= value <= 65_535 else default
 
 
-def manual_window_features() -> str:
-    """按 Xvfb 画布生成受限的人工 popup 几何。
-
-    降低 ``VNC_RESOLUTION`` 可减少活跃人工窗口的像素编码量；非法值始终回退到
-    已验收的 1920x1080，避免 popup 与 Xvfb 尺寸失配而暴露灰色未绘制区域。
-    """
+def vnc_window_geometry() -> tuple[int, int, int]:
+    """返回单个发布窗口的受控宽、高和色深。"""
     parts = os.getenv("VNC_RESOLUTION", VNC_DEFAULT_RESOLUTION).split("x")
     try:
         width, height, depth = (int(part) for part in parts)
     except ValueError:
-        width, height, depth = 1920, 1080, 24
+        return 1920, 1080, 24
     if (
         not 800 <= width <= 3840
         or not 600 <= height <= 2160
         or depth not in {16, 24, 32}
     ):
-        width, height = 1920, 1080
+        return 1920, 1080, 24
+    return width, height, depth
+
+
+def window_slot_coordinates(slot_index: int) -> tuple[int, int]:
+    """把窗口放到共享 Xvfb 的独立槽位，避免顶层窗口相互遮挡。"""
+    width, height, _ = vnc_window_geometry()
+    try:
+        configured_columns = int(os.getenv("WINDOW_PUBLISHER_GRID_COLUMNS", "5"))
+    except ValueError:
+        configured_columns = 5
+    columns = max(1, min(16, configured_columns))
+    slot = max(0, slot_index)
+    return (slot % columns) * width, (slot // columns) * height
+
+
+def manual_window_features(slot_index: int = 0) -> str:
+    """按 Xvfb 画布生成受限的人工 popup 几何。
+
+    降低 ``VNC_RESOLUTION`` 可减少活跃人工窗口的像素编码量；非法值始终回退到
+    已验收的 1920x1080，避免 popup 与 Xvfb 尺寸失配而暴露灰色未绘制区域。
+    """
+    width, height, _ = vnc_window_geometry()
+    left, top = window_slot_coordinates(slot_index)
     # Firefox 的原生窗口 chrome 占用约 71 像素；窗口内容仍由 Xvfb 分辨率决定。
     # 显式关闭地址栏、工具栏和菜单栏，避免 VNC 画面暴露浏览器导航 chrome。
     # 仍为 Firefox 原生标题栏预留约 71 像素，防止 popup 超出 Xvfb 画布导致底部裁剪。
     return (
-        f"popup=yes,width={width},height={max(1, height - 71)},"
+        f"popup=yes,width={width},height={max(1, height - 71)},left={left},top={top},"
         "location=no,toolbar=no,menubar=no,status=no,personalbar=no,"
         "scrollbars=yes,resizable=yes"
+    )
+
+
+def task_window_features(slot_index: int) -> str:
+    """任务观察窗口与人工窗口共用槽位网格，防止互相覆盖。"""
+    cell_width, cell_height, _ = vnc_window_geometry()
+    left, top = window_slot_coordinates(slot_index)
+    return (
+        f"popup=yes,width={min(1440, cell_width)},"
+        f"height={min(900, max(1, cell_height - 71))},left={left},top={top}"
     )
 
 
@@ -256,6 +285,7 @@ class ManagedWindow:
     tab: TabState
     window_id: str
     kind: str
+    slot_index: int = 0
     state: str = "window_ready"
     publisher: WindowPublisher | None = None
     rfb_port: int | None = None
@@ -411,6 +441,14 @@ class BrowserService:
         )
         self.executions: dict[str, Execution] = {}
         self._execution_lock = asyncio.Lock()
+
+    def _next_window_slot(self) -> int:
+        """返回当前 Xvfb 网格中最小的空闲槽位。"""
+        used_slots = {window.slot_index for window in self.windows.values()}
+        for slot_index in range(max(0, MAX_TABS_GLOBAL)):
+            if slot_index not in used_slots:
+                return slot_index
+        raise ProtocolError(429, "Window publisher capacity is exhausted")
 
     async def start(self) -> None:
         # A v4 sidecar must provide account-scoped native windows. Advertising a
@@ -751,6 +789,7 @@ class BrowserService:
                         raise ProtocolError(404, "Tab not found")
                     popup: Page | None = None
                     window_id_task: asyncio.Task[str] | None = None
+                    slot_index = self._next_window_slot()
                     create_stage = "inspect_windows"
                     try:
                         existing_window_ids = set(
@@ -758,9 +797,9 @@ class BrowserService:
                         )
                         create_stage = "open_popup"
                         features = (
-                            manual_window_features()
+                            manual_window_features(slot_index)
                             if kind == "manual"
-                            else "popup=yes,width=1440,height=900"
+                            else task_window_features(slot_index)
                         )
                         async with tab.page.expect_popup(timeout=5_000) as popup_event:
                             opened = await tab.page.evaluate(
@@ -814,6 +853,7 @@ class BrowserService:
                         tab=target_tab,
                         window_id=window_id,
                         kind=kind,
+                        slot_index=slot_index,
                     )
                     self.windows[handle] = window
                     self._window_handles_by_tab[(user_id, target_tab.tab_id)] = handle

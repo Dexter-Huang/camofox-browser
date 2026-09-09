@@ -43,6 +43,14 @@ hard limit; a positive value bounds concurrent manual windows and is derived
 from `RPA_MANUAL_SESSION_MAX_CONCURRENT`. The browser client never receives an
 RFB port or X11 window identifier.
 
+Window publishers share one Firefox process and one X11 display, but their
+native windows must not overlap: `x11vnc -id` cannot reliably read pixels from
+an obscured top-level window. The entrypoint expands Xvfb into a bounded grid
+derived from `VNC_RESOLUTION`, `MAX_TABS_GLOBAL`, and
+`WINDOW_PUBLISHER_GRID_COLUMNS`; manual and task windows reserve and reuse one
+grid slot each. Only the selected window is published, never the expanded root
+desktop.
+
 ## Authorized interaction pacing
 
 Provider automation owns the reviewed DOM interaction rules for all six

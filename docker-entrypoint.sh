@@ -25,6 +25,7 @@ fi
 
 DISPLAY="${CAMOFOX_VNC_DISPLAY:-:99}"
 VNC_RESOLUTION="${VNC_RESOLUTION:-1920x1080x24}"
+WINDOW_PUBLISHER_GRID_COLUMNS="${WINDOW_PUBLISHER_GRID_COLUMNS:-5}"
 VNC_PORT="${VNC_PORT:-5900}"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
 VNC_BIND="${VNC_BIND:-127.0.0.1}"
@@ -46,7 +47,42 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 0' INT TERM
 
-Xvfb "$DISPLAY" -screen 0 "$VNC_RESOLUTION" -ac -nolisten tcp &
+# x11vnc -id 只能可靠读取未被其他顶层窗口遮挡的像素。窗口发布模式因此使用
+# 扩展的单屏 Xvfb 网格；Firefox 仍只有一个进程，每个发布窗口只占一个槽位。
+XVFB_RESOLUTION="$VNC_RESOLUTION"
+if window_publisher_enabled; then
+  IFS=x read -r window_width window_height window_depth <<<"$VNC_RESOLUTION"
+  case "$window_width:$window_height:$window_depth:$WINDOW_PUBLISHER_GRID_COLUMNS:${MAX_TABS_GLOBAL:-30}" in
+    *[!0-9:]*|*::* )
+      echo "Invalid window publisher grid configuration" >&2
+      exit 1
+      ;;
+  esac
+  if (( window_width < 800 || window_width > 3840 \
+      || window_height < 600 || window_height > 2160 \
+      || (window_depth != 16 && window_depth != 24 && window_depth != 32) )); then
+    window_width=1920
+    window_height=1080
+    window_depth=24
+    VNC_RESOLUTION="1920x1080x24"
+  fi
+  grid_capacity="${MAX_TABS_GLOBAL:-30}"
+  grid_columns="$WINDOW_PUBLISHER_GRID_COLUMNS"
+  (( grid_capacity >= 1 )) || grid_capacity=1
+  (( grid_columns >= 1 )) || grid_columns=1
+  (( grid_columns <= 16 )) || grid_columns=16
+  (( grid_columns <= grid_capacity )) || grid_columns="$grid_capacity"
+  grid_rows=$(( (grid_capacity + grid_columns - 1) / grid_columns ))
+  xvfb_width=$(( window_width * grid_columns ))
+  xvfb_height=$(( window_height * grid_rows ))
+  if (( xvfb_width > 32767 || xvfb_height > 32767 )); then
+    echo "Window publisher grid exceeds X11 coordinate limits" >&2
+    exit 1
+  fi
+  XVFB_RESOLUTION="${xvfb_width}x${xvfb_height}x${window_depth}"
+fi
+
+Xvfb "$DISPLAY" -screen 0 "$XVFB_RESOLUTION" -ac -nolisten tcp &
 XVFB_PID=$!
 for _ in $(seq 1 50); do
   xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break

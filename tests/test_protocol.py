@@ -33,6 +33,7 @@ from app.main import (
     request_object,
     service,
     tab_operation,
+    task_window_features,
     wait_for_manual_window_paint,
 )
 from app.main import ExecutionCreateRequest
@@ -1206,15 +1207,51 @@ def test_manual_window_features_follow_valid_xvfb_resolution(
     """人工 popup 必须跟随 Xvfb 尺寸，避免 VNC 右侧产生未绘制区域。"""
     monkeypatch.setenv("VNC_RESOLUTION", "1280x720x24")
     assert manual_window_features() == (
-        "popup=yes,width=1280,height=649,location=no,toolbar=no,menubar=no,status=no,"
+        "popup=yes,width=1280,height=649,left=0,top=0,location=no,toolbar=no,menubar=no,status=no,"
         "personalbar=no,scrollbars=yes,resizable=yes"
     )
 
     monkeypatch.setenv("VNC_RESOLUTION", "invalid")
     assert manual_window_features() == (
-        "popup=yes,width=1920,height=1009,location=no,toolbar=no,menubar=no,status=no,"
+        "popup=yes,width=1920,height=1009,left=0,top=0,location=no,toolbar=no,menubar=no,status=no,"
         "personalbar=no,scrollbars=yes,resizable=yes"
     )
+
+
+def test_manual_window_features_place_each_publisher_in_a_non_overlapping_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """共享 Xvfb 中的原生窗口必须平铺，否则被遮挡窗口的 x11vnc 帧会变黑。"""
+    monkeypatch.setenv("VNC_RESOLUTION", "1280x720x24")
+    monkeypatch.setenv("WINDOW_PUBLISHER_GRID_COLUMNS", "3")
+
+    assert "left=0,top=0" in manual_window_features(0)
+    assert "left=1280,top=0" in manual_window_features(1)
+    assert "left=0,top=720" in manual_window_features(3)
+    assert "left=1280,top=720" in manual_window_features(4)
+
+    task_features = task_window_features(4)
+    assert "width=1280,height=649" in task_features
+    assert "left=1280,top=720" in task_features
+
+
+def test_window_slot_allocator_reuses_a_released_gap() -> None:
+    """关闭人工窗口后应复用空槽，而不是无限扩大 Xvfb 坐标。"""
+    service = BrowserService()
+    session = SessionState(user_id="profile-key", context=Mock())
+    tab = TabState(tab_id="tab-1", page=Mock(), session=session)
+    for slot_index in (0, 2):
+        window = ManagedWindow(
+            handle=f"window-{slot_index}",
+            user_id=session.user_id,
+            tab=tab,
+            window_id=f"0x{slot_index + 1:x}",
+            kind="manual",
+            slot_index=slot_index,
+        )
+        service.windows[window.handle] = window
+
+    assert service._next_window_slot() == 1
 
 
 def test_manual_window_waits_for_first_paint_before_vnc_publish(
