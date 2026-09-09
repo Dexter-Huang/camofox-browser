@@ -15,10 +15,13 @@ import sys
 from contextlib import suppress
 from dataclasses import dataclass
 
-WINDOW_DISCOVERY_ATTEMPTS = 20
-WINDOW_DISCOVERY_DELAY_SECONDS = 0.15
-PUBLISHER_READINESS_ATTEMPTS = 20
-PUBLISHER_READINESS_DELAY_SECONDS = 0.15
+# 20 路并发时 Firefox popup 和 x11vnc 会同时争用单个浏览器进程的 CPU。
+# 原来的约 3 秒窗口容易把“启动较慢”误判成发布失败并返回 409；仍保留有界
+# 等待，避免真正异常时请求无限挂起。
+WINDOW_DISCOVERY_ATTEMPTS = 50
+WINDOW_DISCOVERY_DELAY_SECONDS = 0.2
+PUBLISHER_READINESS_ATTEMPTS = 50
+PUBLISHER_READINESS_DELAY_SECONDS = 0.2
 _DISPLAY_PATTERN = re.compile(r"^:[0-9]+$")
 _WINDOW_ID_PATTERN = re.compile(r"^0x[0-9a-f]+$", re.IGNORECASE)
 
@@ -160,17 +163,17 @@ class WindowPublisher:
     display: str
     window_id: str
     rfb_port: int
-    websocket_port: int
+    websocket_port: int | None = None
+    expose_rfb_to_docker_network: bool = False
     _x11vnc: asyncio.subprocess.Process | None = None
     _bridge: asyncio.subprocess.Process | None = None
 
     @property
     def running(self) -> bool:
-        return bool(
-            self._x11vnc
-            and self._bridge
-            and self._x11vnc.returncode is None
-            and self._bridge.returncode is None
+        if self._x11vnc is None or self._x11vnc.returncode is not None:
+            return False
+        return self.websocket_port is None or (
+            self._bridge is not None and self._bridge.returncode is None
         )
 
     async def start(self) -> None:
@@ -178,50 +181,62 @@ class WindowPublisher:
         if not valid_display(self.display) or not valid_window_id(self.window_id):
             raise RuntimeError("Window publisher target is invalid")
         assert_tcp_port_available(self.rfb_port)
-        assert_tcp_port_available(self.websocket_port)
-        self._x11vnc = await asyncio.create_subprocess_exec(
+        if self.websocket_port is not None:
+            assert_tcp_port_available(self.websocket_port)
+        command = [
             "x11vnc",
             "-display",
             self.display,
             "-id",
             self.window_id,
-            "-localhost",
-            "-nopw",
-            "-forever",
-            "-shared",
-            "-rfbport",
-            str(self.rfb_port),
-            "-noxdamage",
-            "-wait",
-            "10",
-            "-defer",
-            "10",
-            "-wait_ui",
-            "1",
-            "-setdefer",
-            "-1",
-            "-quiet",
+        ]
+        # 人工认证由 GEO 应用容器直接转发 RFB，不能再限制为当前容器 localhost。
+        # Compose 不映射动态 RFB 端口到宿主机，外部浏览器仍只能访问受控同源代理。
+        if not self.expose_rfb_to_docker_network:
+            command.append("-localhost")
+        command.extend(
+            [
+                "-nopw",
+                "-forever",
+                "-shared",
+                "-rfbport",
+                str(self.rfb_port),
+                "-noxdamage",
+                "-wait",
+                "10",
+                "-defer",
+                "10",
+                "-wait_ui",
+                "1",
+                "-setdefer",
+                "-1",
+                "-quiet",
+            ]
+        )
+        self._x11vnc = await asyncio.create_subprocess_exec(
+            *command,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
         try:
             await wait_for_tcp_port(self.rfb_port)
             await wait_for_rfb_greeting(self.rfb_port)
-            environment = os.environ | {"RFB_TARGET_PORT": str(self.rfb_port)}
-            self._bridge = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-m",
-                "uvicorn",
-                "app.novnc:app",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                str(self.websocket_port),
-                env=environment,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await wait_for_tcp_port(self.websocket_port)
+            if self.websocket_port is not None:
+                environment = os.environ | {"RFB_TARGET_PORT": str(self.rfb_port)}
+                self._bridge = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "app.novnc:app",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    str(self.websocket_port),
+                    env=environment,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await wait_for_tcp_port(self.websocket_port)
         except Exception:
             await self.stop()
             raise

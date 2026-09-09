@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, TypedDict
@@ -78,6 +79,17 @@ class NetworkPayloadFormat(str, Enum):
     CONNECT = "connect"
 
 
+# 六个平台的单次执行最多允许十分钟；这是从提交到最终结果（含有限重试和 DOM 兜底）
+# 的总预算，后端只能等待该任务终态，不能通过任务参数改变 sidecar 的规则。
+PLATFORM_EXECUTION_TIMEOUT_SECONDS = 10 * 60.0
+# 网络监听的首段等待只给两分钟。这样网络流异常时能尽快进入同一 execution 的 DOM 兜底，
+# 而不是把十分钟总预算全部消耗在“首个网络响应尚未出现”这一阶段。
+NETWORK_FIRST_RESPONSE_TIMEOUT_SECONDS = 2 * 60.0
+# 元宝会把搜索卡片和最终正文拆到相邻的两个 SSE 响应中；正文到达后保留短暂
+# 收集窗口，等待同一 execution 的搜索卡片，不延长整体十分钟执行预算。
+YUANBAO_CITATION_GRACE_SECONDS = 2.0
+
+
 class NetworkAnswerParser(str, Enum):
     """平台响应正文的静态解析器类型。"""
 
@@ -123,7 +135,7 @@ class NetworkAnswerPolicy:
     endpoints: tuple[NetworkEndpoint, ...]
     parser: NetworkAnswerParser = NetworkAnswerParser.JSON_TEXT_FIELDS
     minimum_answer_characters: int = 20
-    timeout_seconds: float = 180.0
+    timeout_seconds: float = NETWORK_FIRST_RESPONSE_TIMEOUT_SECONDS
     max_response_bytes: int = 2 * 1024 * 1024
 
     def __post_init__(self) -> None:
@@ -147,7 +159,7 @@ class AnswerWaitPolicy:
 
     quiet_seconds: float = 2.0
     # 超时属于平台规则的一部分：后端只等待 execution 终态，不推断任一平台的流式时长。
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = NETWORK_FIRST_RESPONSE_TIMEOUT_SECONDS
     generation_active_selectors: tuple[str, ...] = ()
     # 仅将达到稳定窗口后的有效回答视为结果。默认值为 1，避免将空的占位容器持久化为回答。
     # 不能把此值盲目设大，因为平台确实可能对简单问题给出很短的有效回答。
@@ -198,6 +210,10 @@ class InteractionPacingPolicy:
     characters_per_chunk: int = 8
     chunk_pause_seconds: float = 0.35
     submit_settle_seconds: float = 0.35
+    # 提交后若迟迟没有观察到受限聊天请求，允许在该窗口内进行有界重试。
+    # 重试间隔必须大于零，且只适用于尚未确认提交的平台规则。
+    submission_retry_window_seconds: float = 0.0
+    submission_retry_interval_seconds: float = 10.0
     pointer_motion_steps: int = 6
     # 默认完成“指针移动 -> hover -> focus”。少数页面会将可输入 textarea 置于会
     # 拦截 hover 的过渡层下，此时仍保留受控指针移动，但直接调用 Locator.focus。
@@ -210,6 +226,8 @@ class InteractionPacingPolicy:
             self.focus_settle_seconds < 0
             or self.entry_settle_seconds < 0
             or self.submit_settle_seconds < 0
+            or self.submission_retry_window_seconds < 0
+            or self.submission_retry_interval_seconds <= 0
         ):
             raise ValueError("Interaction settle durations must not be negative")
         if self.key_delay_milliseconds < 0:
@@ -298,7 +316,8 @@ DOUBAO_NETWORK_ANSWER = NetworkAnswerPolicy(
     # 豆包 completion 在页面已完成渲染后可能继续保持 SSE。正常情况下仍优先等待
     # 网络终态；超过这个有限窗口即转入同一 execution 的严格 main 兜底，而不是把
     # 调度器阻塞到长连接自然关闭。
-    timeout_seconds=45.0,
+    # 豆包检索型问题首段可能延迟，但首个网络响应最多等两分钟；剩余时间归总执行预算管理。
+    timeout_seconds=NETWORK_FIRST_RESPONSE_TIMEOUT_SECONDS,
 )
 KIMI_NETWORK_ANSWER = NetworkAnswerPolicy(
     endpoints=(
@@ -364,7 +383,25 @@ RULES: dict[ProviderName, ProviderRule] = {
             entry_settle_seconds=1.0,
             characters_per_chunk=500,
             hover_before_focus=False,
+            # 豆包发送按钮点击后可能需要较长时间创建 completion 流；最多在一分钟内
+            # 每十秒确认一次，只有未观察到聊天请求时才允许再次点击发送。
+            submission_retry_window_seconds=60.0,
+            submission_retry_interval_seconds=10.0,
         ),
+        # 豆包首页会异步弹出“下载电脑版”提示。该弹窗是普通产品推广，不涉及登录、
+        # 验证码或订阅授权；只允许点击当前弹窗明确提供的关闭/稍后提醒控件，不能使用
+        # 全局坐标或模糊的 ``.close`` 选择器，以免误关会话内容。
+        dismiss_selectors=(
+            "button[aria-label='关闭']",
+            "[role='button'][aria-label='关闭']",
+            "button[aria-label='关闭弹窗']",
+            "[role='button'][aria-label='关闭弹窗']",
+            "button:has-text('下次提醒我')",
+            "[role='button']:has-text('下次提醒我')",
+            ":text-is('下次提醒我')",
+        ),
+        # 关闭控件可能在首屏动画期间才挂载；这里只轮询 3 秒，未出现即继续正常流程。
+        dismiss_wait_seconds=3.0,
         submit_near_prompt=True,
         navigate_on_prepare=False,
     ),
@@ -456,7 +493,7 @@ RULES: dict[ProviderName, ProviderRule] = {
             quiet_seconds=8.0,
             # DeepSeek 的检索、推理与正文之间可能出现数秒无文本更新；较长超时只由
             # sidecar 内的固定规则拥有，避免后端重新获得平台特定的完成判断职责。
-            timeout_seconds=180.0,
+            timeout_seconds=NETWORK_FIRST_RESPONSE_TIMEOUT_SECONDS,
             generation_active_selectors=(
                 "button:has-text('停止生成')",
                 "button[aria-label*='Stop']",
@@ -710,6 +747,11 @@ _CITATION_PATTERN = re.compile(
     r'"url"\s*:\s*"((?:\\.|[^"\\])*)"[^{}]{0,1200}?"(?:title|name)"\s*:\s*"((?:\\.|[^"\\])*)"'
 )
 _SSE_DATA_PATTERN = re.compile(r"(?m)^data:\s*(.+)$")
+# 元宝正文里的内部下划线标注只服务于其网页渲染器，不能进入持久化 Markdown。
+_YUANBAO_ANNOTATION_MARK_PATTERN = re.compile(r"\[\]\(@mark_underline=\d+\)")
+_YUANBAO_BUBBLE_CITATION_PATTERN = re.compile(
+    r'"text"\s*:\s*"((?:\\.|[^"\\])*)"\s*,\s*"link"\s*:\s*"((?:\\.|[^"\\])*)"'
+)
 # DeepSeek 的真实回答增量在 p=response/content 事件的 d 字段中；普通 content
 # 字段可能只是免责声明或界面状态，不能作为交付正文。
 
@@ -765,7 +807,8 @@ def _yuanbao_answer_from_payload(payload: str) -> str:
         for item in contents:
             if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
                 fragments.append(item["text"])
-    return _merge_stream_fragments(fragments)
+    answer = _merge_stream_fragments(fragments)
+    return _YUANBAO_ANNOTATION_MARK_PATTERN.sub("", answer)
 
 
 def _deepseek_answer_from_payload(payload: str) -> str:
@@ -944,7 +987,182 @@ def _network_answer_from_payload(payload: str, policy: NetworkAnswerPolicy) -> s
     return answer if len(answer) >= policy.minimum_answer_characters else ""
 
 
-def _network_citations_from_payload(payload: str) -> list[Citation]:
+def _append_citation(
+    citations: list[Citation], seen_urls: set[str], url: object, title: object
+) -> None:
+    """校验并追加一条公开引用，拒绝非 HTTP 链接和空标题。"""
+
+    if not isinstance(url, str) or not isinstance(title, str):
+        return
+    normalized_url = url.strip()
+    normalized_title = title.strip()
+    parsed = urlsplit(normalized_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or not normalized_title
+        or normalized_url in seen_urls
+    ):
+        return
+    seen_urls.add(normalized_url)
+    citations.append({"url": normalized_url, "title": normalized_title})
+
+
+def _collect_doubao_citations(
+    value: object, citations: list[Citation], seen_urls: set[str]
+) -> None:
+    """从豆包已审查的 ``text_card`` 与 ``meta_info`` 节点提取引用。
+
+    豆包把检索卡片放在 ``search_query_result_block.results``，把正文内联引用
+    放在 ``meta_info[].info`` 的 JSON 字符串中。只遍历这两个明确节点，不扫描任意
+    ``url`` 字段，避免把图标、埋点或会话资源地址当成来源。
+    """
+
+    if isinstance(value, Mapping):
+        text_card = value.get("text_card")
+        if isinstance(text_card, Mapping):
+            _append_citation(
+                citations,
+                seen_urls,
+                text_card.get("url"),
+                text_card.get("title"),
+            )
+        meta_info = value.get("meta_info")
+        if isinstance(meta_info, list):
+            for item in meta_info:
+                if not isinstance(item, Mapping) or item.get("type") != 2:
+                    continue
+                info = item.get("info")
+                if not isinstance(info, str):
+                    continue
+                try:
+                    info_value = json.loads(info)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(info_value, Mapping):
+                    _append_citation(
+                        citations,
+                        seen_urls,
+                        info_value.get("url"),
+                        info_value.get("title"),
+                    )
+        for child in value.values():
+            _collect_doubao_citations(child, citations, seen_urls)
+    elif isinstance(value, list):
+        for child in value:
+            _collect_doubao_citations(child, citations, seen_urls)
+
+
+def _collect_yuanbao_citations(
+    value: object, citations: list[Citation], seen_urls: set[str]
+) -> None:
+    """从元宝 ``deepSearchAgent`` 的已审查搜索卡片中提取引用。
+
+    元宝搜索结果使用 ``bubbles[].link`` 保存地址、``bubbles[].text`` 保存标题，
+    与其他平台常见的 ``url/title`` 命名不同。这里只处理明确的 ``web_search``
+    工具节点和其 ``bubbleList`` 项，避免把正文、图标或会话元数据里的任意 URL
+    错当成引用来源。
+    """
+
+    if not isinstance(value, Mapping):
+        if isinstance(value, list):
+            for child in value:
+                _collect_yuanbao_citations(child, citations, seen_urls)
+        return
+
+    if value.get("type") == "searchGuid":
+        # 正文完成后元宝会额外发送 searchGuid 事件，docs 才是右侧“引用来源”面板
+        # 使用的稳定来源清单；优先使用 title，缺失时再使用 webSiteSource。
+        docs = value.get("docs")
+        if isinstance(docs, list):
+            for doc in docs:
+                if not isinstance(doc, Mapping):
+                    continue
+                title = doc.get("title")
+                if not isinstance(title, str) or not title.strip():
+                    title = doc.get("webSiteSource")
+                _append_citation(citations, seen_urls, doc.get("url"), title)
+
+    if value.get("type") == "deepSearchAgent":
+        contents = value.get("contents")
+        if isinstance(contents, list):
+            for content in contents:
+                if not isinstance(content, Mapping):
+                    continue
+                if content.get("type") != "toolCall" or content.get("tcname") != "web_search":
+                    continue
+                items = content.get("items")
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, Mapping) or item.get("type") != "bubbleList":
+                        continue
+                    bubbles = item.get("bubbles")
+                    if not isinstance(bubbles, list):
+                        continue
+                    for bubble in bubbles:
+                        if not isinstance(bubble, Mapping):
+                            continue
+                        _append_citation(
+                            citations,
+                            seen_urls,
+                            bubble.get("link"),
+                            bubble.get("text"),
+                        )
+
+    # 某些版本把 deepSearchAgent 包装成字符串后再放进 SSE，无法还原为 Mapping；
+    # 对这类响应仅在 Yuanbao 专属解析器中读取紧邻的 text/link 对，作为协议兼容层。
+
+    # 同一响应可能把工具节点包在 data、payload 等容器中；继续遍历容器，
+    # 但不会对普通字符串做 URL 正则扫描。
+    for child in value.values():
+        if isinstance(child, (Mapping, list)):
+            _collect_yuanbao_citations(child, citations, seen_urls)
+
+
+def _collect_wenxin_citations(
+    value: object, citations: list[Citation], seen_urls: set[str]
+) -> None:
+    """提取文心 ``thinkingSteps.referenceList`` 中的公开来源。
+
+    文心将检索结果放在思考事件的 ``referenceList``，正文事件本身只有
+    ``markdown-yiyan`` 增量。仅接受该固定组件下的 ``url + text/source`` 字段，
+    避免把图标地址、分享地址或正文中的链接误当成引用。
+    """
+
+    if not isinstance(value, Mapping):
+        if isinstance(value, list):
+            for child in value:
+                _collect_wenxin_citations(child, citations, seen_urls)
+        return
+
+    generator = value.get("generator")
+    if isinstance(generator, Mapping) and generator.get("component") == "thinkingSteps":
+        data = generator.get("data")
+        if isinstance(data, Mapping):
+            references = data.get("referenceList")
+            if isinstance(references, list):
+                for reference in references:
+                    if not isinstance(reference, Mapping):
+                        continue
+                    title = reference.get("text")
+                    if not isinstance(title, str) or not title.strip():
+                        title = reference.get("source")
+                    _append_citation(
+                        citations,
+                        seen_urls,
+                        reference.get("url"),
+                        title,
+                    )
+
+    for child in value.values():
+        if isinstance(child, (Mapping, list)):
+            _collect_wenxin_citations(child, citations, seen_urls)
+
+
+def _network_citations_from_payload(
+    payload: str, parser: NetworkAnswerParser | None = None
+) -> list[Citation]:
     """提取响应中紧邻 URL 的标题字段，并按 URL 去重。"""
 
     citations: list[Citation] = []
@@ -952,17 +1170,42 @@ def _network_citations_from_payload(payload: str) -> list[Citation]:
     for raw_url, raw_title in _CITATION_PATTERN.findall(payload):
         url = _decode_json_string(raw_url).strip()
         title = _decode_json_string(raw_title).strip()
-        parsed = urlsplit(url)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or not title
-            or url in seen_urls
-        ):
-            continue
-        seen_urls.add(url)
-        citations.append({"url": url, "title": title})
-    return citations
+        _append_citation(citations, seen_urls, url, title)
+    if parser is NetworkAnswerParser.DOUBAO_CONTENT_BLOCK_EVENT:
+        for raw_event in _SSE_DATA_PATTERN.findall(payload):
+            if raw_event == "[DONE]":
+                continue
+            try:
+                event = json.loads(raw_event)
+            except json.JSONDecodeError:
+                continue
+            _collect_doubao_citations(event, citations, seen_urls)
+    elif parser is NetworkAnswerParser.YUANBAO_TEXT_EVENT:
+        for raw_title, raw_url in _YUANBAO_BUBBLE_CITATION_PATTERN.findall(payload):
+            _append_citation(
+                citations,
+                seen_urls,
+                _decode_json_string(raw_url),
+                _decode_json_string(raw_title),
+            )
+        for raw_event in _SSE_DATA_PATTERN.findall(payload):
+            if raw_event == "[DONE]":
+                continue
+            try:
+                event = json.loads(raw_event)
+            except json.JSONDecodeError:
+                continue
+            _collect_yuanbao_citations(event, citations, seen_urls)
+    elif parser is NetworkAnswerParser.WENXIN_MARKDOWN_EVENT:
+        for raw_event in _SSE_DATA_PATTERN.findall(payload):
+            if raw_event == "[DONE]":
+                continue
+            try:
+                event = json.loads(raw_event)
+            except json.JSONDecodeError:
+                continue
+            _collect_wenxin_citations(event, citations, seen_urls)
+    return citations[:50]
 
 
 @dataclass(frozen=True)
@@ -989,8 +1232,14 @@ class NetworkAnswerListener:
         self._armed = False
         self._closed = False
         self._result: NetworkAnswer | None = None
+        # 元宝通常先返回 web_search 卡片、再返回正文；在正文尚未形成时暂存已清洗
+        # 的引用，绝不暂存原始响应字节。该列表只存在于当前 execution 内存中。
+        self._pending_citations: list[Citation] = []
+        self._pending_citation_urls: set[str] = set()
         self._error_code: str | None = None
         self._completed = asyncio.Event()
+        # 仅记录是否出现了本轮匹配聊天请求，不保存请求内容；用于提交后的短时确认。
+        self._submission_observed = asyncio.Event()
         self._tasks: set[asyncio.Task[None]] = set()
 
         def on_response(response: Response) -> None:
@@ -1006,11 +1255,23 @@ class NetworkAnswerListener:
             raise ProviderAutomationError("page_unavailable", "Network listener is already closed")
         self._armed = True
 
+    def reset_submission_observed(self) -> None:
+        """清除本次点击的观测标记；仅在尚未看到聊天请求时允许再次点击。"""
+
+        if self._closed:
+            raise ProviderAutomationError("page_unavailable", "Network listener is already closed")
+        self._submission_observed.clear()
+
     def _schedule(self, response: Response) -> None:
-        if not self._armed or self._closed or self._result is not None:
+        if not self._armed or self._closed:
+            return
+        # 元宝的引用卡片可能晚于正文响应到达；其他平台一旦形成结果即停止读取后续
+        # 响应，避免把页面状态或第二轮会话内容混入结果。
+        if self._result is not None and self._policy.parser is not NetworkAnswerParser.YUANBAO_TEXT_EVENT:
             return
         if not any(endpoint.matches(response.url, response.request.method) for endpoint in self._policy.endpoints):
             return
+        self._submission_observed.set()
         task = asyncio.create_task(self._consume(response))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -1028,16 +1289,34 @@ class NetworkAnswerListener:
                 return
             payload = body.decode("utf-8", errors="replace")
             answer = _network_answer_from_payload(payload, self._policy)
-            if not answer:
+            citations = _network_citations_from_payload(payload, self._policy.parser)
+            if not answer and self._result is None:
+                if self._policy.parser is NetworkAnswerParser.YUANBAO_TEXT_EVENT:
+                    for citation in citations:
+                        if citation["url"] in self._pending_citation_urls:
+                            continue
+                        self._pending_citation_urls.add(citation["url"])
+                        self._pending_citations.append(citation)
                 return
             # HTTP 响应已完整交给 Playwright，且正文满足严格字段与长度校验，才允许
             # 产生最终结果。SSE 的 [DONE] 是额外终态证据；Connect 与部分平台不提供
             # 通用结束帧，因此以受限响应自然结束作为其唯一可审计的完成信号。
-            self._result = NetworkAnswer(
-                markdown=answer,
-                citations=_network_citations_from_payload(payload),
-            )
-            self._completed.set()
+            if self._result is None:
+                merged_citations = [*self._pending_citations, *citations]
+                self._result = NetworkAnswer(markdown=answer, citations=merged_citations[:50])
+                if self._policy.parser is NetworkAnswerParser.YUANBAO_TEXT_EVENT:
+                    # 让后续搜索响应有机会补齐来源；期间仍只保留清洗后的结构化数据。
+                    await asyncio.sleep(YUANBAO_CITATION_GRACE_SECONDS)
+                self._completed.set()
+            elif citations:
+                merged = list(self._result.citations)
+                seen_urls = {item["url"] for item in merged}
+                for citation in citations:
+                    if citation["url"] in seen_urls:
+                        continue
+                    seen_urls.add(citation["url"])
+                    merged.append(citation)
+                self._result = NetworkAnswer(markdown=self._result.markdown, citations=merged[:50])
         except Exception:
             # 不记录 URL、正文或异常字符串；这些内容可能含会话标识。失败只在任务级
             # 收敛为稳定错误码，由既有截图和人工认证流程处理。
@@ -1047,10 +1326,17 @@ class NetworkAnswerListener:
             # 明确断开原始字节引用，执行完成后监听器只保留已清洗的结构化结果。
             body = b"" if "body" in locals() else b""
 
-    async def wait_result(self) -> NetworkAnswer:
-        """等待单个平台的网络终态，超时不使用 DOM 或再次提交问题。"""
+    async def wait_result(self, timeout_seconds: float | None = None) -> NetworkAnswer:
+        """等待网络终态；可传入总执行预算剩余时间，避免阶段超时叠加。"""
 
-        deadline = time.monotonic() + self._policy.timeout_seconds
+        effective_timeout = (
+            self._policy.timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        if effective_timeout <= 0:
+            raise ProviderAutomationError("answer_timeout", "Provider network answer timed out")
+        deadline = time.monotonic() + effective_timeout
         while not self._completed.is_set() and time.monotonic() < deadline:
             remaining = max(0.0, deadline - time.monotonic())
             try:
@@ -1065,6 +1351,19 @@ class NetworkAnswerListener:
             self._error_code or "answer_incomplete",
             "Provider network answer was incomplete",
         )
+
+    async def wait_submission_observed(self, timeout_seconds: float) -> None:
+        """等待本轮提交对应的受限聊天请求出现，避免提交后无条件停顿。"""
+
+        try:
+            await asyncio.wait_for(
+                self._submission_observed.wait(), timeout=timeout_seconds
+            )
+        except TimeoutError as exc:
+            raise ProviderAutomationError(
+                "submission_not_dispatched",
+                "Provider chat request was not observed after submission",
+            ) from exc
 
     async def close(self) -> None:
         """取消未完成的读取并移除页面回调，防止跨 execution 保留任何数据。"""
@@ -1199,9 +1498,11 @@ async def _dismiss_non_auth_dialogs(page: Page, rule: ProviderRule) -> bool:
     # 每轮仍只查询规则白名单中的精确候选；没有任何模糊 selector、强制点击或认证操作。
     deadline = time.monotonic() + rule.dismiss_wait_seconds
     while True:
+        selector_supported = False
         for selector in rule.dismiss_selectors:
-            button = page.locator(selector).first
             try:
+                button = page.locator(selector).first
+                selector_supported = True
                 if await button.is_visible(timeout=500) and await button.is_enabled(timeout=500):
                     await _move_pointer_to_locator(page, button, rule.interaction_pacing)
                     await button.click(timeout=5_000, no_wait_after=True)
@@ -1210,6 +1511,10 @@ async def _dismiss_non_auth_dialogs(page: Page, rule: ProviderRule) -> bool:
                 # 提示层可能已经由平台关闭或正在重绘。继续同一静态白名单的短时检查，
                 # 不能把任意页面异常误判为可以绕过认证的理由。
                 continue
+        # 测试伪页面或页面重建期间可能暂时不支持某个选择器；没有任何候选能被
+        # 解析时直接结束本轮，避免在不具备白名单 DOM 的页面上空转等待窗口。
+        if not selector_supported:
+            return False
         if time.monotonic() >= deadline:
             return False
         await asyncio.sleep(0.2)

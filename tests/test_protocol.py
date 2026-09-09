@@ -28,6 +28,7 @@ from app.main import (
     ensure_allowed_url,
     error_response,
     http_exception_response,
+    manual_window_features,
     normalize_spec,
     request_object,
     service,
@@ -175,6 +176,147 @@ def test_network_answer_preserves_markdown_and_returns_only_structured_citations
     ]
 
 
+def test_doubao_network_citations_extract_search_cards_and_inline_meta() -> None:
+    """豆包检索卡片和正文内联引用都应转换为统一来源模型。"""
+
+    inline_info = json.dumps(
+        {
+            "insert_text": "(官方资料)",
+            "url": "https://example.com/official",
+            "title": "官方资料",
+        },
+        ensure_ascii=False,
+    )
+    payload = "data: " + json.dumps(
+        {
+            "content": {
+                "content_block": [
+                    {
+                        "content": {
+                            "search_query_result_block": {
+                                "results": [
+                                    {
+                                        "text_card": {
+                                            "url": "https://example.com/search",
+                                            "title": "检索来源",
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                        "meta_info": [{"type": 2, "info": inline_info}],
+                    }
+                ]
+            }
+        },
+        ensure_ascii=False,
+    )
+    policy = rule_for("doubao").network_answer
+    assert policy is not None
+
+    assert _network_citations_from_payload(payload, policy.parser) == [
+        {"url": "https://example.com/search", "title": "检索来源"},
+        {"url": "https://example.com/official", "title": "官方资料"},
+    ]
+
+
+def test_yuanbao_network_citations_extract_search_bubbles() -> None:
+    """元宝搜索卡片的 ``link/text`` 应映射为统一引用模型。"""
+
+    payload = "data: " + json.dumps(
+        {
+            "type": "deepSearchAgent",
+            "contents": [
+                {
+                    "type": "toolCall",
+                    "tcname": "web_search",
+                    "items": [
+                        {
+                            "type": "bubbleList",
+                            "bubbles": [
+                                {
+                                    "text": "官方资料",
+                                    "link": "https://example.com/official",
+                                },
+                                {
+                                    "text": "重复来源",
+                                    "link": "https://example.com/official",
+                                },
+                                {"text": "图标而非来源", "link": "https://"},
+                            ],
+                        }
+                    ],
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    policy = rule_for("yuanbao").network_answer
+    assert policy is not None
+
+    assert _network_citations_from_payload(payload, policy.parser) == [
+        {"url": "https://example.com/official", "title": "官方资料"}
+    ]
+
+
+def test_wenxin_network_citations_extract_reference_list() -> None:
+    """文心思考事件中的 referenceList 应转换为统一引用模型。"""
+
+    payload = "data:" + json.dumps(
+        {
+            "data": {
+                "message": {
+                    "content": {
+                        "generator": {
+                            "component": "thinkingSteps",
+                            "data": {
+                                "referenceList": [
+                                    {
+                                        "url": "https://example.com/dji",
+                                        "text": "DJI 官方网站",
+                                        "source": "DJI",
+                                    }
+                                ]
+                            },
+                        }
+                    }
+                }
+            }
+        },
+        ensure_ascii=False,
+    )
+    policy = rule_for("wenxin").network_answer
+    assert policy is not None
+
+    assert _network_citations_from_payload(payload, policy.parser) == [
+        {"url": "https://example.com/dji", "title": "DJI 官方网站"}
+    ]
+
+
+def test_yuanbao_network_citations_extract_search_guid_docs() -> None:
+    """元宝 searchGuid 事件的 docs 是引用面板来源清单。"""
+
+    payload = "data: " + json.dumps(
+        {
+            "type": "searchGuid",
+            "docs": [
+                {
+                    "title": "DJI 官方网站",
+                    "url": "https://www.dji.com/cn",
+                    "webSiteSource": "DJI",
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    policy = rule_for("yuanbao").network_answer
+    assert policy is not None
+
+    assert _network_citations_from_payload(payload, policy.parser) == [
+        {"url": "https://www.dji.com/cn", "title": "DJI 官方网站"}
+    ]
+
+
 def test_network_answer_uses_yuanbao_text_events_only() -> None:
     """元宝搜索状态和 follow-up 事件不能混入快速回答的 Markdown。"""
 
@@ -295,7 +437,17 @@ def test_v4_submission_contracts_are_strongly_typed_and_kimi_rejects_short_label
     # 豆包动画 textarea 在 focus 后会消失，必须优先使用稳定的富文本输入框。
     assert RULES[ProviderName.DOUBAO].prompt_selectors[0] == "[contenteditable='true']"
     assert RULES[ProviderName.DOUBAO].interaction_pacing.entry_settle_seconds == 1.0
-    assert RULES[ProviderName.DOUBAO].network_answer.timeout_seconds == 45.0
+    assert "button[aria-label='关闭']" in RULES[ProviderName.DOUBAO].dismiss_selectors
+    assert ":text-is('下次提醒我')" in RULES[ProviderName.DOUBAO].dismiss_selectors
+    assert RULES[ProviderName.DOUBAO].dismiss_wait_seconds == 3.0
+    # 六个平台统一使用十分钟网络等待窗口，覆盖检索型问题的长首段延迟。
+    assert RULES[ProviderName.DOUBAO].network_answer.timeout_seconds == 120.0
+    assert all(
+        rule.network_answer is not None and rule.network_answer.timeout_seconds == 120.0
+        for rule in RULES.values()
+    )
+    assert RULES[ProviderName.DOUBAO].interaction_pacing.submission_retry_window_seconds == 60.0
+    assert RULES[ProviderName.DOUBAO].interaction_pacing.submission_retry_interval_seconds == 10.0
 
 
 def test_answer_wait_policy_rejects_platform_placeholder_text() -> None:
@@ -1026,6 +1178,42 @@ def test_window_publisher_is_an_optional_v4_capability(
     monkeypatch.setenv("ENABLE_WINDOW_PUBLISHER", "true")
 
     assert BrowserService().protocol_version == 4
+
+
+def test_manual_window_allocates_only_a_private_rfb_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """人工认证由 GEO 直连 RFB，不得为每个窗口分配 bridge 端口。"""
+    monkeypatch.setenv("WINDOW_PUBLISHER_RFB_BASE_PORT", "5902")
+    monkeypatch.setenv("WINDOW_PUBLISHER_WS_BASE_PORT", "6082")
+    instance = BrowserService()
+
+    manual_rfb_port, manual_websocket_port = instance._next_window_ports(
+        websocket_required=False
+    )
+    task_rfb_port, task_websocket_port = instance._next_window_ports(
+        websocket_required=True
+    )
+
+    assert (manual_rfb_port, manual_websocket_port) == (5902, None)
+    assert (task_rfb_port, task_websocket_port) == (5903, 6082)
+
+
+def test_manual_window_features_follow_valid_xvfb_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """人工 popup 必须跟随 Xvfb 尺寸，避免 VNC 右侧产生未绘制区域。"""
+    monkeypatch.setenv("VNC_RESOLUTION", "1280x720x24")
+    assert manual_window_features() == (
+        "popup=yes,width=1280,height=649,location=no,toolbar=no,menubar=no,status=no,"
+        "personalbar=no,scrollbars=yes,resizable=yes"
+    )
+
+    monkeypatch.setenv("VNC_RESOLUTION", "invalid")
+    assert manual_window_features() == (
+        "popup=yes,width=1920,height=1009,location=no,toolbar=no,menubar=no,status=no,"
+        "personalbar=no,scrollbars=yes,resizable=yes"
+    )
 
 
 def test_v4_sidecar_is_not_ready_without_the_window_publisher(

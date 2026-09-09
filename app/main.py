@@ -36,6 +36,8 @@ from playwright.async_api import Browser, BrowserContext, Locator, Page, Respons
 from app.provider_automation import (
     Citation,
     NetworkAnswerListener,
+    PLATFORM_EXECUTION_TIMEOUT_SECONDS,
+    NETWORK_FIRST_RESPONSE_TIMEOUT_SECONDS,
     answer_dom_baseline,
     ProviderAutomationError,
     ProviderName,
@@ -69,11 +71,12 @@ STORAGE_STATE_TIMEOUT_SECONDS = 12
 TAB_CLOSE_TIMEOUT_SECONDS = 8
 TAB_CREATE_TIMEOUT_SECONDS = 95
 VNC_DEFAULT_RESOLUTION = "1920x1080x24"
+WINDOW_PUBLISHER_RFB_BASE_PORT = 5902
 WINDOW_PUBLISHER_WS_BASE_PORT = 6082
-WINDOW_PUBLISHER_RFB_OFFSET = 180
 # 人工窗口包含独立 Firefox popup、x11vnc 与 WebSocket bridge；该限制必须和
 # GEO API 的 RPA_MANUAL_SESSION_MAX_CONCURRENT 使用同一部署值。
-MAX_MANUAL_WINDOWS = int(os.getenv("MAX_MANUAL_WINDOWS", "3"))
+# 0 表示不设置人工窗口硬上限；正整数时必须与 GEO API 的部署配置一致。
+MAX_MANUAL_WINDOWS = int(os.getenv("MAX_MANUAL_WINDOWS", "0"))
 MAX_TABS_PER_SESSION = int(os.getenv("MAX_TABS_PER_SESSION", "3"))
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", os.getenv("RPA_BROWSER_CAPACITY", "30")))
 MAX_TABS_GLOBAL = int(os.getenv("MAX_TABS_GLOBAL", os.getenv("RPA_BROWSER_CAPACITY", "30")))
@@ -139,6 +142,33 @@ def bounded_port(name: str, default: int) -> int:
     return value if 1 <= value <= 65_535 else default
 
 
+def manual_window_features() -> str:
+    """按 Xvfb 画布生成受限的人工 popup 几何。
+
+    降低 ``VNC_RESOLUTION`` 可减少活跃人工窗口的像素编码量；非法值始终回退到
+    已验收的 1920x1080，避免 popup 与 Xvfb 尺寸失配而暴露灰色未绘制区域。
+    """
+    parts = os.getenv("VNC_RESOLUTION", VNC_DEFAULT_RESOLUTION).split("x")
+    try:
+        width, height, depth = (int(part) for part in parts)
+    except ValueError:
+        width, height, depth = 1920, 1080, 24
+    if (
+        not 800 <= width <= 3840
+        or not 600 <= height <= 2160
+        or depth not in {16, 24, 32}
+    ):
+        width, height = 1920, 1080
+    # Firefox 的原生窗口 chrome 占用约 71 像素；窗口内容仍由 Xvfb 分辨率决定。
+    # 显式关闭地址栏、工具栏和菜单栏，避免 VNC 画面暴露浏览器导航 chrome。
+    # 仍为 Firefox 原生标题栏预留约 71 像素，防止 popup 超出 Xvfb 画布导致底部裁剪。
+    return (
+        f"popup=yes,width={width},height={max(1, height - 71)},"
+        "location=no,toolbar=no,menubar=no,status=no,personalbar=no,"
+        "scrollbars=yes,resizable=yes"
+    )
+
+
 @dataclass
 class Capture:
     capture_id: str
@@ -184,6 +214,7 @@ class ManagedWindow:
     kind: str
     state: str = "window_ready"
     publisher: WindowPublisher | None = None
+    rfb_port: int | None = None
     websocket_port: int | None = None
 
 
@@ -325,6 +356,9 @@ class BrowserService:
         self.windows: dict[str, ManagedWindow] = {}
         self._window_handles_by_tab: dict[tuple[str, str], str] = {}
         self._window_lock = asyncio.Lock()
+        self._next_window_rfb_port = bounded_port(
+            "WINDOW_PUBLISHER_RFB_BASE_PORT", WINDOW_PUBLISHER_RFB_BASE_PORT
+        )
         self._next_window_ws_port = bounded_port(
             "WINDOW_PUBLISHER_WS_BASE_PORT", WINDOW_PUBLISHER_WS_BASE_PORT
         )
@@ -658,19 +692,26 @@ class BrowserService:
             manual_window_count = sum(
                 window.kind == "manual" for window in self.windows.values()
             )
-            if kind == "manual" and manual_window_count >= MAX_MANUAL_WINDOWS:
+            if (
+                kind == "manual"
+                and MAX_MANUAL_WINDOWS > 0
+                and manual_window_count >= MAX_MANUAL_WINDOWS
+            ):
                 raise ProtocolError(429, "Manual window capacity is exhausted")
             async with tab.session.lock:
                 async with tab.lock:
                     if tab.session.tabs.get(tab_id) is not tab:
                         raise ProtocolError(404, "Tab not found")
                     popup: Page | None = None
+                    window_id_task: asyncio.Task[str] | None = None
+                    create_stage = "inspect_windows"
                     try:
                         existing_window_ids = set(
                             top_level_window_ids(await read_x11_window_tree(self.x11_display))
                         )
+                        create_stage = "open_popup"
                         features = (
-                            "popup=yes,width=1920,height=1009"
+                            manual_window_features()
                             if kind == "manual"
                             else "popup=yes,width=1440,height=900"
                         )
@@ -685,16 +726,33 @@ class BrowserService:
                         if opened is not True:
                             raise RuntimeError("Firefox blocked the controlled popup")
                         popup = await popup_event.value
+                        create_stage = "set_popup_title"
                         title = f"GEO_RPA_WINDOW_{uuid4().hex}"
                         await popup.evaluate("title => { document.title = title; }", title)
-                        await popup.goto(tab.page.url, wait_until="commit", timeout=90_000)
-                        window_id = await wait_for_new_x11_window_id(
-                            self.x11_display, existing_window_ids
+                        # 原生 popup 映射到 X11 后即可并行查找窗口；导航无需等待该结果。
+                        window_id_task = asyncio.create_task(
+                            wait_for_new_x11_window_id(self.x11_display, existing_window_ids)
                         )
+                        create_stage = "navigate_popup"
+                        await popup.goto(tab.page.url, wait_until="commit", timeout=90_000)
+                        create_stage = "discover_window"
+                        window_id = await window_id_task
                     except Exception as exc:
+                        if window_id_task is not None:
+                            if not window_id_task.done():
+                                window_id_task.cancel()
+                            with suppress(asyncio.CancelledError, Exception):
+                                await window_id_task
                         if popup is not None:
                             with suppress(Exception):
                                 await popup.close()
+                        logger.warning(
+                            "CAMOFOX_MANUAL_WINDOW_CREATE stage=failed profile=%s "
+                            "create_stage=%s error_type=%s",
+                            profile_log_id(user_id),
+                            create_stage,
+                            type(exc).__name__,
+                        )
                         raise ProtocolError(409, "Unable to create the controlled X11 window") from exc
 
                     if len(tab.session.tabs) >= MAX_TABS_PER_SESSION:
@@ -812,17 +870,24 @@ class BrowserService:
             )
         return True
 
-    def _next_window_ports(self) -> tuple[int, int]:
+    def _next_window_ports(
+        self, *, websocket_required: bool
+    ) -> tuple[int, int | None]:
         """为单个账号窗口分配容器内唯一端口对。
 
         人工认证与任务观察共用这一分配器，保证不同账号绝不会复用同一 RFB 或
         WebSocket 上游；端口只返回给应用后端代理，绝不进入浏览器前端。
         """
-        websocket_port = self._next_window_ws_port
-        rfb_port = websocket_port - WINDOW_PUBLISHER_RFB_OFFSET
-        if not 1024 <= rfb_port <= 65535 or websocket_port > 65535:
+        rfb_port = self._next_window_rfb_port
+        websocket_port = self._next_window_ws_port if websocket_required else None
+        if (
+            not 1024 <= rfb_port < WINDOW_PUBLISHER_WS_BASE_PORT
+            or (websocket_port is not None and websocket_port > 65535)
+        ):
             raise ProtocolError(503, "Window publisher port range is exhausted")
-        self._next_window_ws_port += 1
+        self._next_window_rfb_port += 1
+        if websocket_port is not None:
+            self._next_window_ws_port += 1
         return rfb_port, websocket_port
 
     async def publish_window(self, handle: str, user_id: str) -> ManagedWindow:
@@ -836,20 +901,30 @@ class BrowserService:
             if window.publisher is not None:
                 await window.publisher.stop()
                 window.publisher = None
+                window.rfb_port = None
                 window.websocket_port = None
-            rfb_port, websocket_port = self._next_window_ports()
+            rfb_port, websocket_port = self._next_window_ports(
+                websocket_required=window.kind == "task"
+            )
             publisher = WindowPublisher(
                 display=self.x11_display,
                 window_id=window.window_id,
                 rfb_port=rfb_port,
                 websocket_port=websocket_port,
+                expose_rfb_to_docker_network=window.kind == "manual",
             )
             try:
                 await publisher.start()
             except Exception as exc:
                 window.state = "failed"
+                logger.warning(
+                    "CAMOFOX_WINDOW_PUBLISH stage=failed profile=%s error_type=%s",
+                    profile_log_id(user_id),
+                    type(exc).__name__,
+                )
                 raise ProtocolError(409, "Window publisher could not start") from exc
             window.publisher = publisher
+            window.rfb_port = rfb_port
             window.websocket_port = websocket_port
             window.state = "published"
             return window
@@ -862,6 +937,7 @@ class BrowserService:
                 return False
             publisher = window.publisher
             window.publisher = None
+            window.rfb_port = None
             window.websocket_port = None
             if window.state != "failed":
                 window.state = "window_ready"
@@ -985,6 +1061,8 @@ class BrowserService:
     async def _run_execution(self, execution: Execution) -> None:
         rule = rule_for(execution.provider)
         listener: NetworkAnswerListener | None = None
+        # 一个 execution 只有一个总截止时间；网络监听、提交确认和 DOM 兜底共享该预算。
+        execution_deadline = time.monotonic() + PLATFORM_EXECUTION_TIMEOUT_SECONDS
         try:
             async with execution.tab.lock:
                 # 网络监听器在提交前绑定到 execution 独占页面。它只能命中
@@ -995,10 +1073,43 @@ class BrowserService:
                 # DOM 只作为网络流无终态时的兜底基线。它不参与正常网络结果的
                 # Markdown 或引用合并，避免将工作台、导航和搜索状态写入结果。
                 baseline_count = await answer_dom_baseline(execution.tab.page, rule)
-                await submit_provider(execution.tab.page, rule)
+                pacing = rule.interaction_pacing
+                retry_window = pacing.submission_retry_window_seconds
+                retry_deadline = min(
+                    execution_deadline,
+                    time.monotonic() + retry_window,
+                )
+                while True:
+                    # 只有尚未观察到受限聊天请求时才会再次点击，绝不重发已确认的问题。
+                    listener.reset_submission_observed()
+                    await submit_provider(execution.tab.page, rule)
+                    if retry_window <= 0:
+                        break
+                    remaining_retry = retry_deadline - time.monotonic()
+                    if remaining_retry <= 0:
+                        raise ProviderAutomationError(
+                            "submission_not_dispatched",
+                            "Provider chat request was not observed after submission",
+                        )
+                    try:
+                        await listener.wait_submission_observed(
+                            min(pacing.submission_retry_interval_seconds, remaining_retry)
+                        )
+                        break
+                    except ProviderAutomationError as submission_error:
+                        if submission_error.code != "submission_not_dispatched":
+                            raise
+                        if time.monotonic() >= retry_deadline:
+                            raise
                 execution.state = "generating"
                 try:
-                    network_answer = await listener.wait_result()
+                    remaining_execution = execution_deadline - time.monotonic()
+                    network_answer = await listener.wait_result(
+                        min(
+                            NETWORK_FIRST_RESPONSE_TIMEOUT_SECONDS,
+                            remaining_execution,
+                        )
+                    )
                     answer_markdown = network_answer.markdown
                     citations = network_answer.citations
                 except ProviderAutomationError as network_error:
@@ -1006,9 +1117,11 @@ class BrowserService:
                         raise
                     # 平台 SSE 长连接未关闭或协议短暂改版时，才使用同一 execution
                     # 新增的回答卡片。绝不因兜底重新提交问题或读取整页文本。
+                    remaining_execution = execution_deadline - time.monotonic()
                     answer_markdown, citations = await wait_result(
                         execution.tab.page,
                         rule,
+                        timeout_seconds=remaining_execution,
                         baseline_count=baseline_count,
                         submitted_query=execution.query,
                     )
@@ -1602,9 +1715,9 @@ async def open_manual_window_vnc(handle: str, request: Request) -> dict[str, int
         if window is None or window.user_id != user_id or window.kind != "manual":
             raise ProtocolError(404, "Manual window not found")
         window = await service.publish_window(handle, user_id)
-        if window.websocket_port is None:
+        if window.rfb_port is None:
             raise ProtocolError(409, "Manual VNC is unavailable")
-        return {"state": window.state, "websocketPort": window.websocket_port}
+        return {"state": window.state, "rfbPort": window.rfb_port}
     except ProtocolError as exc:
         raise error_response(exc) from exc
 

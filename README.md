@@ -35,11 +35,13 @@ backend cannot accept an incomplete v4 deployment. A shared desktop is never
 presented as an account-scoped observer.
 
 Each manual authentication window is published through its own internal
-`x11vnc` and WebSocket bridge. `MAX_MANUAL_WINDOWS` bounds concurrent manual
-windows (the Compose default is 3 and is derived from
-`RPA_MANUAL_SESSION_MAX_CONCURRENT`); the browser client only connects to the
-GEO application's authenticated same-origin proxy and never receives a bridge
-port or X11 window identifier.
+`x11vnc` RFB TCP listener. The GEO application connects to that listener over
+the Docker network and relays RFB bytes through its authenticated same-origin
+WebSocket, so manual windows do not start a per-window Uvicorn/WebSocket
+bridge. `MAX_MANUAL_WINDOWS=0` (the Compose default) means no manual-window
+hard limit; a positive value bounds concurrent manual windows and is derived
+from `RPA_MANUAL_SESSION_MAX_CONCURRENT`. The browser client never receives an
+RFB port or X11 window identifier.
 
 ## Authorized interaction pacing
 
