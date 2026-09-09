@@ -158,13 +158,20 @@ async def stop_process(process: asyncio.subprocess.Process | None) -> None:
 
 @dataclass
 class WindowPublisher:
-    """一个 X11 窗口对应的一对私有 RFB/WebSocket 进程。"""
+    """一个 X11 窗口对应的一对私有 RFB/WebSocket 进程。
+
+    ``capture_wait_ms`` 与 ``capture_defer_ms`` 只控制 x11vnc 读取这个窗口的节奏。
+    人工窗口可用较低帧率降低对共享 Firefox/Xvfb 的持续编码压力；任务观察窗口保持
+    默认值，避免改变自动任务的现有观察时序。
+    """
 
     display: str
     window_id: str
     rfb_port: int
     websocket_port: int | None = None
     expose_rfb_to_docker_network: bool = False
+    capture_wait_ms: int = 10
+    capture_defer_ms: int = 10
     _x11vnc: asyncio.subprocess.Process | None = None
     _bridge: asyncio.subprocess.Process | None = None
 
@@ -180,6 +187,8 @@ class WindowPublisher:
         """启动发布器并仅在 RFB 与 WebSocket 都就绪后返回。"""
         if not valid_display(self.display) or not valid_window_id(self.window_id):
             raise RuntimeError("Window publisher target is invalid")
+        if not 1 <= self.capture_wait_ms <= 1_000 or not 1 <= self.capture_defer_ms <= 1_000:
+            raise RuntimeError("Window publisher capture cadence is invalid")
         assert_tcp_port_available(self.rfb_port)
         if self.websocket_port is not None:
             assert_tcp_port_available(self.websocket_port)
@@ -203,9 +212,9 @@ class WindowPublisher:
                 str(self.rfb_port),
                 "-noxdamage",
                 "-wait",
-                "10",
+                str(self.capture_wait_ms),
                 "-defer",
-                "10",
+                str(self.capture_defer_ms),
                 "-wait_ui",
                 "1",
                 "-setdefer",

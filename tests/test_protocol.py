@@ -33,6 +33,7 @@ from app.main import (
     request_object,
     service,
     tab_operation,
+    wait_for_manual_window_paint,
 )
 from app.main import ExecutionCreateRequest
 from app.provider_automation import (
@@ -1214,6 +1215,81 @@ def test_manual_window_features_follow_valid_xvfb_resolution(
         "popup=yes,width=1920,height=1009,location=no,toolbar=no,menubar=no,status=no,"
         "personalbar=no,scrollbars=yes,resizable=yes"
     )
+
+
+def test_manual_window_waits_for_first_paint_before_vnc_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """人工 VNC 不能在 popup 仅提交导航、尚未进入首帧合成时启动。"""
+
+    async def run() -> None:
+        page = Mock()
+        page.is_closed.return_value = False
+        page.wait_for_load_state = AsyncMock()
+        page.evaluate = AsyncMock()
+        settle = AsyncMock()
+        monkeypatch.setattr("app.main.asyncio.sleep", settle)
+
+        await wait_for_manual_window_paint(page)
+
+        page.wait_for_load_state.assert_awaited_once_with(
+            "domcontentloaded", timeout=5_000
+        )
+        page.evaluate.assert_awaited_once()
+        assert "requestAnimationFrame" in page.evaluate.await_args.args[0]
+        settle.assert_awaited_once_with(0.35)
+
+    asyncio.run(run())
+
+
+def test_manual_window_paint_gate_runs_before_window_publisher_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """发布器只能在人工窗口的首帧门槛完成后读取 X11 framebuffer。"""
+
+    async def run() -> None:
+        events: list[str] = []
+        publisher_options: dict[str, object] = {}
+
+        async def wait_for_paint(_: object) -> None:
+            events.append("paint-ready")
+
+        class Publisher:
+            running = False
+
+            def __init__(self, **options: object) -> None:
+                publisher_options.update(options)
+
+            async def start(self) -> None:
+                events.append("publisher-start")
+
+            async def stop(self) -> None:
+                return None
+
+        instance = BrowserService()
+        page = Mock()
+        page.is_closed.return_value = False
+        session = SessionState(user_id="profile-key", context=Mock())
+        tab = TabState(tab_id="tab-1", page=page, session=session)
+        window = ManagedWindow(
+            handle="window-1",
+            user_id="profile-key",
+            tab=tab,
+            window_id="0x123",
+            kind="manual",
+        )
+        instance.windows[window.handle] = window
+        monkeypatch.setattr("app.main.wait_for_manual_window_paint", wait_for_paint)
+        monkeypatch.setattr("app.main.WindowPublisher", Publisher)
+
+        published = await instance.publish_window(window.handle, window.user_id)
+
+        assert published.state == "published"
+        assert events == ["paint-ready", "publisher-start"]
+        assert publisher_options["capture_wait_ms"] == 40
+        assert publisher_options["capture_defer_ms"] == 40
+
+    asyncio.run(run())
 
 
 def test_v4_sidecar_is_not_ready_without_the_window_publisher(

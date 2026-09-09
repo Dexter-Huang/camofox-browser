@@ -73,6 +73,15 @@ TAB_CREATE_TIMEOUT_SECONDS = 95
 VNC_DEFAULT_RESOLUTION = "1920x1080x24"
 WINDOW_PUBLISHER_RFB_BASE_PORT = 5902
 WINDOW_PUBLISHER_WS_BASE_PORT = 6082
+# ``goto(..., wait_until="commit")`` 只说明导航已被 Firefox 接收，尚不能保证 Xvfb
+# 已合成首帧。人工 VNC 直接附着该原生窗口，过早启动 x11vnc 会把短暂的未绘制区域
+# 传给用户。此等待只用于人工窗口，不让任务窗口的发布时序发生变化。
+MANUAL_WINDOW_PAINT_READY_TIMEOUT_MS = 5_000
+MANUAL_WINDOW_PAINT_SETTLE_SECONDS = 0.35
+# 单 Firefox/Xvfb 部署中，人工用户不需要 100fps 的 VNC。x11vnc 的 -wait/-defer
+# 使用毫秒，这里限制为约 25fps，降低长期人工认证对后台 Tab 绘制和编码的抢占。
+MANUAL_WINDOW_VNC_CAPTURE_WAIT_MS = 40
+MANUAL_WINDOW_VNC_CAPTURE_DEFER_MS = 40
 # 人工窗口包含独立 Firefox popup、x11vnc 与 WebSocket bridge；该限制必须和
 # GEO API 的 RPA_MANUAL_SESSION_MAX_CONCURRENT 使用同一部署值。
 # 0 表示不设置人工窗口硬上限；正整数时必须与 GEO API 的部署配置一致。
@@ -167,6 +176,35 @@ def manual_window_features() -> str:
         "location=no,toolbar=no,menubar=no,status=no,personalbar=no,"
         "scrollbars=yes,resizable=yes"
     )
+
+
+async def wait_for_manual_window_paint(page: Page) -> None:
+    """等待人工 popup 的首帧进入 X11 合成队列。
+
+    人工窗口在导航提交后即可获得 X11 window id，但此时 ``x11vnc`` 若立即连接，
+    首个 framebuffer 常为短暂的黑色或未绘制区域。这里不等待 ``load`` 或网络空闲，
+    以免登录页的长连接、广告或流式资源阻塞人工认证；只等待 DOM 就绪、连续两帧
+    ``requestAnimationFrame``，再给 Xvfb 一个很短的合成稳定时间。
+
+    页面重定向、关闭或站点异常不会阻断人工会话创建。调用方会在发布前再次确认
+    页面仍然存在，失败页面则走既有的窗口未找到语义。
+    """
+    try:
+        await page.wait_for_load_state(
+            "domcontentloaded", timeout=MANUAL_WINDOW_PAINT_READY_TIMEOUT_MS
+        )
+        await page.evaluate(
+            """() => new Promise(resolve => requestAnimationFrame(
+                () => requestAnimationFrame(resolve)
+            ))"""
+        )
+    except Exception as exc:
+        logger.info(
+            "CAMOFOX_MANUAL_WINDOW_PAINT stage=best_effort error_type=%s",
+            type(exc).__name__,
+        )
+    if not page.is_closed():
+        await asyncio.sleep(MANUAL_WINDOW_PAINT_SETTLE_SECONDS)
 
 
 @dataclass
@@ -903,6 +941,12 @@ class BrowserService:
                 window.publisher = None
                 window.rfb_port = None
                 window.websocket_port = None
+            if window.kind == "manual":
+                # VNC 发布器会立即读取该 X11 窗口；先完成轻量首帧门槛，避免客户
+                # 首次连入时把 Firefox/Xvfb 尚未合成的黑色 framebuffer 误认为掉线。
+                await wait_for_manual_window_paint(window.tab.page)
+                if window.tab.page.is_closed():
+                    raise ProtocolError(404, "Window not found")
             rfb_port, websocket_port = self._next_window_ports(
                 websocket_required=window.kind == "task"
             )
@@ -912,6 +956,16 @@ class BrowserService:
                 rfb_port=rfb_port,
                 websocket_port=websocket_port,
                 expose_rfb_to_docker_network=window.kind == "manual",
+                capture_wait_ms=(
+                    MANUAL_WINDOW_VNC_CAPTURE_WAIT_MS
+                    if window.kind == "manual"
+                    else 10
+                ),
+                capture_defer_ms=(
+                    MANUAL_WINDOW_VNC_CAPTURE_DEFER_MS
+                    if window.kind == "manual"
+                    else 10
+                ),
             )
             try:
                 await publisher.start()
