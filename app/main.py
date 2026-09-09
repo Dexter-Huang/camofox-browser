@@ -485,15 +485,15 @@ class BrowserService:
         log_id = profile_log_id(session.user_id)
         logger.info("CAMOFOX_CHECKPOINT stage=started profile=%s", log_id)
         try:
-            # Kimi 等平台会把会话令牌写入 IndexedDB。只保存 Cookie/LocalStorage
-            # 会导致人工认证页面看似成功，但 Context 或 Firefox 进程退出后重新打开
-            # 又回到登录页。Playwright StorageState 支持该受限快照，仍不触及完整
-            # Firefox profile、浏览历史或浏览器扩展数据。
-            # StorageState 通过 Firefox 的 Juggler 通道导出。页面在人工 VNC 中
-            # 停滞时该 RPC 也可能不返回；认证完成接口必须在网关超时前失败，让
-            # 管理端仍能选择取消会话，而不是永久停留在“完成中”。
+            # 人工认证先保存 Cookie 和 Web Storage。Firefox/Juggler 的 IndexedDB
+            # 导出在豆包人工窗口中可能长期不返回，导致完成认证始终 503；而将
+            # IndexedDB 纳入快照也无法保证第三方平台会把登录态放在那里。平台若
+            # 确实依赖 IndexedDB，应改用已验收的原生 Profile 路径，而不是阻塞所有
+            # 六个平台的人工认证。该快照仍不触及完整 Firefox profile、历史或扩展数据。
+            # StorageState 通过 Firefox 的 Juggler 通道导出；页面停滞时 RPC 仍受
+            # 超时保护，确保管理端能够取消会话而不是永久停留在“完成中”。
             state = await asyncio.wait_for(
-                session.context.storage_state(indexed_db=True),
+                session.context.storage_state(indexed_db=False),
                 timeout=STORAGE_STATE_TIMEOUT_SECONDS,
             )
             payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))

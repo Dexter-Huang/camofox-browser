@@ -1260,8 +1260,8 @@ def test_invalid_state_is_quarantined(tmp_path: Path) -> None:
     assert list(state_path.parent.glob("storage-state.invalid-*.json"))
 
 
-def test_storage_state_checkpoint_includes_indexed_db(tmp_path: Path) -> None:
-    """认证令牌在 IndexedDB 时，重启后仍必须可由 StorageState 恢复。"""
+def test_storage_state_checkpoint_excludes_indexed_db(tmp_path: Path) -> None:
+    """人工认证快照不请求 IndexedDB，避免 Firefox/Juggler 导出卡死。"""
 
     async def run() -> None:
         context = AsyncMock()
@@ -1270,8 +1270,7 @@ def test_storage_state_checkpoint_includes_indexed_db(tmp_path: Path) -> None:
         instance.profile_dir = tmp_path
 
         assert await instance._save_state(SessionState(user_id="user-1", context=context)) is True
-
-        context.storage_state.assert_awaited_once_with(indexed_db=True)
+        context.storage_state.assert_awaited_once_with(indexed_db=False)
 
     asyncio.run(run())
 
@@ -1286,7 +1285,7 @@ def test_storage_state_checkpoint_times_out_without_blocking_shutdown(
         stalled = asyncio.Event()
 
         async def storage_state(*, indexed_db: bool) -> dict[str, object]:
-            assert indexed_db is True
+            assert indexed_db is False
             await stalled.wait()
             return {"cookies": [], "origins": []}
 
