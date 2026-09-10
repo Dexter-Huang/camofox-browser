@@ -183,15 +183,16 @@ class WindowPublisher:
             self._bridge is not None and self._bridge.returncode is None
         )
 
-    async def start(self) -> None:
-        """启动发布器并仅在 RFB 与 WebSocket 都就绪后返回。"""
-        if not valid_display(self.display) or not valid_window_id(self.window_id):
-            raise RuntimeError("Window publisher target is invalid")
-        if not 1 <= self.capture_wait_ms <= 1_000 or not 1 <= self.capture_defer_ms <= 1_000:
-            raise RuntimeError("Window publisher capture cadence is invalid")
-        assert_tcp_port_available(self.rfb_port)
-        if self.websocket_port is not None:
-            assert_tcp_port_available(self.websocket_port)
+    def x11vnc_command(self) -> list[str]:
+        """生成单窗口发布命令，并固定动态网页所需的保守 RFB 参数。
+
+        x11vnc 默认会通过窗口移动和页面滚动启发式发送 ``CopyRect``。浏览器页面
+        长时间运行时仍可能有异步布局、光标或滚动更新；旧版 LibVNCServer 在这类
+        增量流中一旦失步，noVNC 会把像素字节误读成下一个矩形的 encoding 并断开。
+        人工会话更重视连续可操作性，因此关闭两种启发式 CopyRect，只保留普通
+        framebuffer 更新。同时取消默认客户端读超时；连接保活由 WebSocket 层负责，
+        不让旧 LibVNCServer 主动插入 1x1 更新与正常矩形发送发生竞争。
+        """
         command = [
             "x11vnc",
             "-display",
@@ -199,8 +200,8 @@ class WindowPublisher:
             "-id",
             self.window_id,
         ]
-        # 人工认证由 GEO 应用容器直接转发 RFB，不能再限制为当前容器 localhost。
-        # Compose 不映射动态 RFB 端口到宿主机，外部浏览器仍只能访问受控同源代理。
+        # 人工认证由 GEO 应用容器直接转发 RFB；任务观察发布器仍限制为容器回环。
+        # Compose 不映射动态 RFB 端口，宿主机与外部浏览器无法绕过同源鉴权代理。
         if not self.expose_rfb_to_docker_network:
             command.append("-localhost")
         command.extend(
@@ -211,6 +212,10 @@ class WindowPublisher:
                 "-rfbport",
                 str(self.rfb_port),
                 "-noxdamage",
+                "-nowirecopyrect",
+                "-noscrollcopyrect",
+                "-readtimeout",
+                "0",
                 "-wait",
                 str(self.capture_wait_ms),
                 "-defer",
@@ -222,8 +227,19 @@ class WindowPublisher:
                 "-quiet",
             ]
         )
+        return command
+
+    async def start(self) -> None:
+        """启动发布器并仅在 RFB 与 WebSocket 都就绪后返回。"""
+        if not valid_display(self.display) or not valid_window_id(self.window_id):
+            raise RuntimeError("Window publisher target is invalid")
+        if not 1 <= self.capture_wait_ms <= 1_000 or not 1 <= self.capture_defer_ms <= 1_000:
+            raise RuntimeError("Window publisher capture cadence is invalid")
+        assert_tcp_port_available(self.rfb_port)
+        if self.websocket_port is not None:
+            assert_tcp_port_available(self.websocket_port)
         self._x11vnc = await asyncio.create_subprocess_exec(
-            *command,
+            *self.x11vnc_command(),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
