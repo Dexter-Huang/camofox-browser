@@ -96,6 +96,17 @@ docker build -f Dockerfile.base -t geo-camofox-browser-base:py312-camoufox152.0.
 docker build --build-arg CAMOFOX_BROWSER_BASE_IMAGE=geo-camofox-browser-base:py312-camoufox152.0.4b29 -t geo-camofox-browser:local .
 ```
 
+Independent Compose deploy from this directory:
+
+```bash
+docker compose --env-file .env --profile build build camofox-browser-base
+docker compose --env-file .env build camofox-browser
+docker compose --env-file .env up -d --no-build camofox-browser
+```
+
+Bind `CAMOFOX_BIND_ADDRESS` to the browser server private IP. GEO reaches this
+sidecar through `CAMOFOX_BROWSER_URL=http://<ip>:<port>`, not Docker DNS.
+
 ## Validation
 
 ```bash

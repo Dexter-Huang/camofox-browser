@@ -1,0 +1,68 @@
+# Camofox Browser 独立部署。GEO 应用通过 CAMOFOX_BROWSER_URL=http://<IP>:<端口> 跨机访问。
+# 只绑定私网 IP；禁止把 REST、RFB、WS 暴露到公网。
+#
+# 在此目录部署：
+#   docker compose --env-file .env --profile build build camofox-browser-base
+#   docker compose --env-file .env build camofox-browser
+#   docker compose --env-file .env up -d --no-build camofox-browser
+#
+# GEO 仓库也可从根目录调用 scripts/deploy-camofox.sh。
+
+name: ${CAMOFOX_COMPOSE_PROJECT_NAME:-geo-camofox}
+
+services:
+  camofox-browser:
+    # Python sidecar 发布 protocol v4。GEO app 按 IP:端口访问，不依赖 Docker DNS。
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CAMOFOX_BROWSER_BASE_IMAGE: ${CAMOFOX_BROWSER_BASE_IMAGE:-geo-camofox-browser-base:py312-camoufox152.0.4b29}
+    image: ${CAMOFOX_BROWSER_IMAGE:-geo-camofox-browser:local}
+    pull_policy: never
+    container_name: ${CAMOFOX_COMPOSE_PROJECT_NAME:-geo-camofox}-browser
+    restart: unless-stopped
+    shm_size: 2gb
+    environment:
+      MAX_SESSIONS: ${RPA_BROWSER_CAPACITY:-30}
+      MAX_TABS_PER_SESSION: "3"
+      MAX_TABS_GLOBAL: ${RPA_BROWSER_CAPACITY:-30}
+      MAX_MANUAL_WINDOWS: ${RPA_MANUAL_SESSION_MAX_CONCURRENT:-0}
+      MANUAL_WINDOW_CREATE_CONCURRENCY: ${RPA_MANUAL_WINDOW_CREATE_CONCURRENCY:-2}
+      SESSION_TIMEOUT_MS: "300000"
+      TAB_INACTIVITY_MS: "300000"
+      TZ: ${CAMOFOX_TIMEZONE:-Asia/Shanghai}
+      ENABLE_WINDOW_PUBLISHER: "true"
+      CAMOFOX_VNC_DISPLAY: ":99"
+      CAMOFOX_VNC_RESOLUTION: ${CAMOFOX_VNC_RESOLUTION:-1920x1080x24}
+      VNC_RESOLUTION: ${CAMOFOX_VNC_RESOLUTION:-1920x1080x24}
+      WINDOW_PUBLISHER_GRID_COLUMNS: ${RPA_WINDOW_PUBLISHER_GRID_COLUMNS:-5}
+    ports:
+      # 控制面 API。app 使用 http://<CAMOFOX_BIND_ADDRESS>:<CAMOFOX_CONTROL_HOST_PORT>
+      - "${CAMOFOX_BIND_ADDRESS:-127.0.0.1}:${CAMOFOX_CONTROL_HOST_PORT:-9377}:9377"
+      # 人工 VNC RFB。app 连同一 IP 和 sidecar 返回的 rfbPort
+      - "${CAMOFOX_BIND_ADDRESS:-127.0.0.1}:${CAMOFOX_RFB_HOST_PORT_START:-5902}-${CAMOFOX_RFB_HOST_PORT_END:-5931}:5902-5931"
+      # 任务观察 websockify。app 连同一 IP 和 sidecar 返回的 websocketPort
+      - "${CAMOFOX_BIND_ADDRESS:-127.0.0.1}:${CAMOFOX_WS_HOST_PORT_START:-6082}-${CAMOFOX_WS_HOST_PORT_END:-6111}:6082-6111"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json, urllib.request; health = json.load(urllib.request.urlopen('http://127.0.0.1:9377/health', timeout=5)); assert health.get('ok') is True and health.get('geoRpaProtocolVersion') == 4 and health.get('browserReady') is True and health.get('persistenceReady') is True",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 18
+      start_period: 90s
+
+  camofox-browser-base:
+    profiles: ["build"]
+    build:
+      context: .
+      dockerfile: Dockerfile.base
+      args:
+        APT_MIRROR: ${CAMOFOX_APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn}
+    image: ${CAMOFOX_BROWSER_BASE_IMAGE:-geo-camofox-browser-base:py312-camoufox152.0.4b29}
+    pull_policy: never
