@@ -1,12 +1,15 @@
-# Camofox Browser 独立部署。GEO 应用通过 CAMOFOX_BROWSER_URL=http://<IP>:<端口> 跨机访问。
-# 只绑定私网 IP；禁止把 REST、RFB、WS 暴露到公网。
+# Camofox Browser 独立部署。日常在本目录执行 docker compose up -d。
+# 无 .env 时默认绑定 127.0.0.1:9377。不要使用仓库根目录 .env.deploy 作为本目录 env-file。
+# GEO 同机 app 使用 CAMOFOX_BROWSER_URL=http://host.docker.internal:9377，不能写 127.0.0.1。
+# 禁止把 REST、RFB、WS 暴露到公网。
 #
-# 在此目录部署：
-#   docker compose --env-file .env --profile build build camofox-browser-base
-#   docker compose --env-file .env build camofox-browser
-#   docker compose --env-file .env up -d --no-build camofox-browser
-#
-# GEO 仓库也可从根目录调用 scripts/deploy-camofox.sh。
+# 镜像已存在：
+#   docker compose up -d
+# 首次或基础镜像变化：
+#   docker compose --profile build build camofox-browser-base
+#   docker compose build camofox-browser
+#   docker compose up -d
+# 需要改绑定 IP 时再复制 .env.example 为 .env。
 
 name: ${CAMOFOX_COMPOSE_PROJECT_NAME:-geo-camofox}
 
