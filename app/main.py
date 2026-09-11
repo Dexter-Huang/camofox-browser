@@ -20,7 +20,6 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Literal, TypedDict, TypeVar
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -48,6 +47,7 @@ from app.provider_automation import (
     submit as submit_provider,
     wait_result,
 )
+from app.session_probe import probe_browser_context
 from app.window_vnc import (
     WindowPublisher,
     read_x11_window_tree,
@@ -68,8 +68,12 @@ MAX_COORDINATE = 10_000
 MAX_WHEEL_DELTA = 10_000
 SESSION_CLOSE_TIMEOUT_SECONDS = 15
 STORAGE_STATE_TIMEOUT_SECONDS = 12
+STORAGE_STATE_MAX_BYTES = 2 * 1024 * 1024
 TAB_CLOSE_TIMEOUT_SECONDS = 8
 TAB_CREATE_TIMEOUT_SECONDS = 95
+BROWSER_WATCHDOG_INTERVAL_SECONDS = max(
+    1.0, float(os.getenv("BROWSER_WATCHDOG_INTERVAL_SECONDS", "5"))
+)
 VNC_DEFAULT_RESOLUTION = "1920x1080x24"
 WINDOW_PUBLISHER_RFB_BASE_PORT = 5902
 WINDOW_PUBLISHER_WS_BASE_PORT = 6082
@@ -353,6 +357,12 @@ class ProfileKeyRequest(V4Request):
 
     profile_key: str = Field(min_length=1, max_length=256)
 
+class AccountSessionHydrateRequest(V4Request):
+    """用 GEO 持有的 Cookie + LocalStorage 快照创建账号 Context。"""
+
+    profile_key: str = Field(min_length=1, max_length=256)
+    storage_state: dict[str, Any] = Field(default_factory=dict)
+
 
 # 路由在运行时自行解析 request，避免 FastAPI 0.115 与新 Pydantic 的字段别名告警；
 # 同时显式复用模型 schema，保证运维仍可在 OpenAPI 中看到固定的 provider 枚举与字段边界。
@@ -377,6 +387,11 @@ class ManualSessionPayload(TypedDict):
 
 class BooleanPayload(TypedDict):
     ok: bool
+
+
+class AccountSessionCheckpointPayload(TypedDict, total=False):
+    ok: bool
+    storageState: dict[str, Any]
 
 
 V4RequestModel = TypeVar("V4RequestModel", bound=V4Request)
@@ -416,12 +431,14 @@ class BrowserService:
         self.sessions: dict[str, SessionState] = {}
         self.sessions_lock = asyncio.Lock()
         # 同一账号的所有关闭入口共用一个任务。公开索引先删除，新的 session_for
-        # 必须等待该任务完成，避免旧 Firefox Context 在后台继续写入同一个 profile。
+        # 必须等待该任务完成，避免旧 Firefox Context 在后台继续被复用。
         self.closing_sessions: dict[str, asyncio.Task[None]] = {}
         self._browser_restart_lock = asyncio.Lock()
+        self._browser_restart_task: asyncio.Task[None] | None = None
+        self._browser_watchdog_task: asyncio.Task[None] | None = None
+        self._shutting_down = False
         self.browser_ready = False
         self.background_tasks: list[asyncio.Task[None]] = []
-        self.profile_dir = Path(os.getenv("CAMOFOX_PROFILE_DIR", "/home/node/.camofox/profiles"))
         self.vnc_enabled = env_flag("ENABLE_VNC")
         # 整桌面 VNC 仅供旧调试用途。v3 只在独立窗口发布器可用时对后端声明。
         self.window_publisher_enabled = env_flag("ENABLE_WINDOW_PUBLISHER")
@@ -451,6 +468,7 @@ class BrowserService:
         raise ProtocolError(429, "Window publisher capacity is exhausted")
 
     async def start(self) -> None:
+        self._shutting_down = False
         # A v4 sidecar must provide account-scoped native windows. Advertising a
         # ready browser without the publisher would let the backend accept an
         # incomplete deployment, so keep readiness false until it is explicit.
@@ -474,14 +492,25 @@ class BrowserService:
             # 预热只证明浏览器可以创建上下文，不会加载第三方页面或写入账号状态。
             context = await launched.new_context()
             await context.close()
-            self.persistence_ready = await self._check_profile_storage()
+            # 登录快照由 GEO MySQL 持有；sidecar 就绪只表示可以创建内存 Context。
+            self.persistence_ready = True
             self.browser_ready = True
             if not self.background_tasks:
                 self.background_tasks.append(asyncio.create_task(self._idle_reaper()))
+            if self._browser_watchdog_task is None or self._browser_watchdog_task.done():
+                self._browser_watchdog_task = asyncio.create_task(
+                    self._browser_watchdog(), name="camoufox-browser-watchdog"
+                )
         except Exception:
+            self.browser_ready = False
             logger.exception("Camoufox prewarm failed")
 
     async def close(self) -> None:
+        self._shutting_down = True
+        if self._browser_watchdog_task is not None:
+            self._browser_watchdog_task.cancel()
+            await asyncio.gather(self._browser_watchdog_task, return_exceptions=True)
+            self._browser_watchdog_task = None
         for task in self.background_tasks:
             task.cancel()
         await asyncio.gather(*self.background_tasks, return_exceptions=True)
@@ -494,20 +523,6 @@ class BrowserService:
         self.browser = None
         self.browser_ready = False
         self.persistence_ready = False
-
-    async def _check_profile_storage(self) -> bool:
-        """探测 profile volume 可写性，不接触任何账号的 StorageState 文件。"""
-        probe = self.profile_dir / f".write-check-{uuid4().hex}"
-        try:
-            await asyncio.to_thread(self.profile_dir.mkdir, parents=True, exist_ok=True)
-            await asyncio.to_thread(probe.write_bytes, b"")
-            await asyncio.to_thread(probe.unlink)
-            return True
-        except OSError:
-            with suppress(OSError):
-                await asyncio.to_thread(probe.unlink)
-            logger.warning("Profile storage is not writable")
-            return False
 
     @property
     def protocol_version(self) -> int:
@@ -540,58 +555,115 @@ class BrowserService:
                 # ``Session is closing``。空 Context 仍会在 SESSION_TIMEOUT_SECONDS
                 # 到期后统一回收，既保留账号隔离，也避免这一短暂竞争窗口。
 
-    def _state_path(self, user_id: str) -> Path:
-        digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:32]
-        return self.profile_dir / digest / "storage-state.json"
+    async def _browser_watchdog(self) -> None:
+        """检测 Camoufox 子进程被 OOM 等原因杀死后，自动重建浏览器。
 
-    async def _load_state(self, user_id: str) -> dict[str, Any] | None:
-        path = self._state_path(user_id)
+        Docker 的 ``restart: unless-stopped`` 只能处理容器主进程退出；
+        Camoufox 被 cgroup OOM Killer 杀死时，Uvicorn 仍可能存活，导致
+        ``/health`` 返回 200 但所有 ``new_context`` 请求持续失败。因此这里
+        由 sidecar 主动观察 Playwright 连接状态并触发一次受控重启。
+        """
+        while not self._shutting_down:
+            await asyncio.sleep(BROWSER_WATCHDOG_INTERVAL_SECONDS)
+            browser = self.browser
+            if (
+                self._shutting_down
+                or not self.browser_ready
+                or browser is None
+                or browser.is_connected()
+            ):
+                continue
+            logger.error(
+                "CAMOFOX_BROWSER_WATCHDOG browser_disconnected active_sessions=%s active_tabs=%s; restarting",
+                len(self.sessions),
+                self.tab_count,
+            )
+            restart_task = self._request_browser_restart()
+            await asyncio.shield(restart_task)
+
+    def _request_browser_restart(self) -> asyncio.Task[None]:
+        """合并并发的浏览器恢复请求，避免 OOM 后重复启动多个实例。"""
+        task = self._browser_restart_task
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._restart_browser(), name="camoufox-browser-restart"
+            )
+            self._browser_restart_task = task
+        return task
+
+    def _normalized_storage_state(self, value: object) -> dict[str, Any] | None:
+        """Return a Playwright-ready snapshot, or None for an empty/logged-out state."""
+        if not isinstance(value, dict):
+            return None
+        cookies = value.get("cookies")
+        if cookies is None:
+            return None
+        if not isinstance(cookies, list):
+            return None
+        origins = value.get("origins")
+        if origins is not None and not isinstance(origins, list):
+            return None
         try:
-            raw = await asyncio.to_thread(path.read_text, "utf-8")
-            state = json.loads(raw)
-            if not isinstance(state, dict) or not isinstance(state.get("cookies"), list):
-                raise ValueError("StorageState cookies are invalid")
-            if "origins" in state and not isinstance(state["origins"], list):
-                raise ValueError("StorageState origins are invalid")
-            return state
-        except FileNotFoundError:
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
             return None
-        except Exception:
-            quarantine = path.with_name(f"storage-state.invalid-{int(time.time())}.json")
-            with suppress(Exception):
-                await asyncio.to_thread(path.replace, quarantine)
-            logger.warning("Invalid StorageState isolated")
+        if len(encoded.encode("utf-8")) > STORAGE_STATE_MAX_BYTES:
             return None
+        return value
 
-    async def _save_state(self, session: SessionState) -> bool:
-        """将受限 StorageState 原子写回账号卷，返回本次 checkpoint 是否成功。"""
-        path = self._state_path(session.user_id)
+    async def _create_browser_context(
+        self, storage_state: dict[str, Any] | None
+    ) -> BrowserContext:
+        if self.browser is None or not self.browser_ready:
+            raise ProtocolError(503, "Camoufox Browser is not ready")
+        try:
+            if storage_state is None:
+                return await self.browser.new_context()
+            return await self.browser.new_context(storage_state=storage_state)
+        except Exception as exc:
+            browser = self.browser
+            disconnected = browser is None or not browser.is_connected()
+            target_closed = (
+                "target" in str(exc).lower()
+                and "closed" in str(exc).lower()
+            )
+            if disconnected or target_closed:
+                self.browser_ready = False
+                self.persistence_ready = False
+                self._request_browser_restart()
+                raise ProtocolError(
+                    503, "Camoufox Browser could not create a session"
+                ) from None
+            if storage_state is None:
+                raise ProtocolError(503, "Camoufox Browser could not create a session") from None
+            try:
+                return await self.browser.new_context()
+            except Exception:
+                raise ProtocolError(503, "Camoufox Browser could not create a session") from None
+
+    async def _export_storage_state(self, session: SessionState) -> dict[str, Any] | None:
+        """Export Cookie + LocalStorage only; never write a local profile file."""
         started_at = time.monotonic()
         log_id = profile_log_id(session.user_id)
         logger.info("CAMOFOX_CHECKPOINT stage=started profile=%s", log_id)
         try:
-            # 人工认证先保存 Cookie 和 Web Storage。Firefox/Juggler 的 IndexedDB
-            # 导出在豆包人工窗口中可能长期不返回，导致完成认证始终 503；而将
-            # IndexedDB 纳入快照也无法保证第三方平台会把登录态放在那里。平台若
-            # 确实依赖 IndexedDB，应改用已验收的原生 Profile 路径，而不是阻塞所有
-            # 六个平台的人工认证。该快照仍不触及完整 Firefox profile、历史或扩展数据。
-            # StorageState 通过 Firefox 的 Juggler 通道导出；页面停滞时 RPC 仍受
-            # 超时保护，确保管理端能够取消会话而不是永久停留在“完成中”。
             state = await asyncio.wait_for(
                 session.context.storage_state(indexed_db=False),
                 timeout=STORAGE_STATE_TIMEOUT_SECONDS,
             )
-            payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
-            await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
-            temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-            await asyncio.to_thread(temporary.write_text, payload, "utf-8")
-            await asyncio.to_thread(temporary.replace, path)
+            if not isinstance(state, dict) or not isinstance(state.get("cookies"), list):
+                logger.warning(
+                    "CAMOFOX_CHECKPOINT stage=invalid profile=%s elapsed_ms=%s",
+                    log_id,
+                    int((time.monotonic() - started_at) * 1000),
+                )
+                return None
             logger.info(
                 "CAMOFOX_CHECKPOINT stage=completed profile=%s elapsed_ms=%s",
                 log_id,
                 int((time.monotonic() - started_at) * 1000),
             )
-            return True
+            return state
         except TimeoutError:
             logger.warning(
                 "CAMOFOX_CHECKPOINT stage=timed_out profile=%s timeout_seconds=%s elapsed_ms=%s",
@@ -599,17 +671,46 @@ class BrowserService:
                 STORAGE_STATE_TIMEOUT_SECONDS,
                 int((time.monotonic() - started_at) * 1000),
             )
-            return False
+            return None
         except Exception:
-            # 登录态内容绝不写入日志，checkpoint 失败也不能阻止 Context 正常关闭。
             logger.exception(
                 "CAMOFOX_CHECKPOINT stage=failed profile=%s elapsed_ms=%s",
                 log_id,
                 int((time.monotonic() - started_at) * 1000),
             )
-            return False
+            return None
+
+    async def hydrate_account_session(
+        self, profile_key: str, storage_state: object
+    ) -> None:
+        """仅在账号尚无内存 Context 时应用 GEO 快照；已有会话忽略入站快照。"""
+        await self._session_for(
+            profile_key,
+            storage_state=self._normalized_storage_state(storage_state),
+            apply_storage_state=True,
+        )
+
+    async def checkpoint_account_session(self, profile_key: str) -> dict[str, Any]:
+        """Return the live snapshot so GEO can persist it; 404 if no Context exists."""
+        session = self.sessions.get(profile_key)
+        if session is None:
+            raise ProtocolError(404, "Account session not found")
+        session.last_access = time.monotonic()
+        state = await self._export_storage_state(session)
+        if state is None:
+            raise ProtocolError(503, "Camofox Browser could not persist the authenticated session")
+        return state
 
     async def session_for(self, user_id: str) -> SessionState:
+        return await self._session_for(user_id, storage_state=None, apply_storage_state=False)
+
+    async def _session_for(
+        self,
+        user_id: str,
+        *,
+        storage_state: dict[str, Any] | None,
+        apply_storage_state: bool,
+    ) -> SessionState:
         if not user_id or len(user_id) > 256:
             raise ProtocolError(400, "userId is required")
         while True:
@@ -617,9 +718,6 @@ class BrowserService:
                 existing = self.sessions.get(user_id)
                 closing = self.closing_sessions.get(user_id)
                 if closing is not None and closing.done():
-                    # The close task normally removes itself in finally. Retire a
-                    # completed barrier here as well so a cancelled shutdown task
-                    # cannot make a later session request spin indefinitely.
                     self.closing_sessions.pop(user_id, None)
                     closing = None
                 if existing is not None:
@@ -629,8 +727,6 @@ class BrowserService:
                 await asyncio.shield(closing)
                 continue
             async with self.sessions_lock:
-                # Re-check after acquiring the creation lock: a concurrent close may
-                # have just installed its barrier while this request was waiting.
                 if user_id in self.closing_sessions:
                     continue
                 existing = self.sessions.get(user_id)
@@ -641,17 +737,11 @@ class BrowserService:
                     raise ProtocolError(503, "Camoufox Browser is not ready")
                 if len(self.sessions) >= MAX_SESSIONS:
                     raise ProtocolError(429, "Maximum sessions reached")
-                state = await self._load_state(user_id)
-                try:
-                    context = await self.browser.new_context(storage_state=state) if state else await self.browser.new_context()
-                except Exception:
-                    if state is None:
-                        raise ProtocolError(503, "Camoufox Browser could not create a session") from None
-                    path = self._state_path(user_id)
-                    quarantine = path.with_name(f"storage-state.invalid-{int(time.time())}.json")
-                    with suppress(Exception):
-                        await asyncio.to_thread(path.replace, quarantine)
-                    context = await self.browser.new_context()
+                # Hydrate applies GEO snapshot only when creating a Context.
+                # Later tab/execution calls reuse the live session and ignore inbound state.
+                context = await self._create_browser_context(
+                    storage_state if apply_storage_state else None
+                )
                 session = SessionState(user_id=user_id, context=context)
                 self.sessions[user_id] = session
                 return session
@@ -677,7 +767,6 @@ class BrowserService:
                 await self._close_windows_for_user(session.user_id)
                 for tab in list(session.tabs.values()):
                     await self.close_tab(tab)
-                await self._save_state(session)
                 try:
                     await asyncio.wait_for(session.context.close(), SESSION_CLOSE_TIMEOUT_SECONDS)
                 except Exception:
@@ -699,23 +788,27 @@ class BrowserService:
 
     async def _restart_browser(self) -> None:
         """隔离无法关闭的 Context，重建单一浏览器进程后才允许新的账号会话。"""
-        async with self._browser_restart_lock:
-            # A browser restart invalidates every Context in the old process. Remove
-            # their public indexes before terminating it, so future requests cannot
-            # use stale pages or write a profile while recovery is in progress.
-            async with self.sessions_lock:
-                stale_sessions = list(self.sessions.values())
-                self.sessions.clear()
-                self.browser_ready = False
-                self.persistence_ready = False
-            for stale in stale_sessions:
-                await self._close_windows_for_user(stale.user_id)
-            if self._camoufox is not None:
-                with suppress(Exception):
-                    await self._camoufox.__aexit__(None, None, None)
-            self._camoufox = None
-            self.browser = None
-            await self.start()
+        try:
+            async with self._browser_restart_lock:
+                # A browser restart invalidates every Context in the old process. Remove
+                # their public indexes before terminating it, so future requests cannot
+                # reuse stale pages while recovery is in progress.
+                async with self.sessions_lock:
+                    stale_sessions = list(self.sessions.values())
+                    self.sessions.clear()
+                    self.browser_ready = False
+                    self.persistence_ready = False
+                for stale in stale_sessions:
+                    await self._close_windows_for_user(stale.user_id)
+                if self._camoufox is not None:
+                    with suppress(Exception):
+                        await self._camoufox.__aexit__(None, None, None)
+                self._camoufox = None
+                self.browser = None
+                await self.start()
+        finally:
+            if self._browser_restart_task is asyncio.current_task():
+                self._browser_restart_task = None
 
     async def create_tab(self, user_id: str, url: str) -> TabState:
         ensure_allowed_url(url)
@@ -1252,7 +1345,6 @@ class BrowserService:
             # sidecar 的受限卷内，执行结果和失败证据则由后端拉取后按其保留期持久化。
             # sidecar 重启会丢失 execution registry；后端看到 execution_not_found 时必须
             # 把已提交任务收敛为不确定状态，绝不可重新提交。
-            await self._save_state(execution.tab.session)
             await self.close_tab(execution.tab)
 
     async def capture_execution_preview(self, execution_id: str) -> bytes:
@@ -1306,19 +1398,27 @@ class BrowserService:
     async def account_keepalive(
         self, provider: ProviderName, profile_key: str
     ) -> Literal["ok", "login_required", "verification_required", "uncertain"]:
-        """平台规则在 sidecar 内执行，后端只接收稳定账号状态。"""
+        """优先用已 hydrate 的 Context 打平台用户接口，无法判定时再开临时页。
+
+        平台 URL 与业务码判定留在 sidecar。调用方仍然只传 provider 与 profileKey，
+        只收回稳定账号状态。接口探活不新开 Tab；页面保活仍用独立临时页，避免覆盖
+        正在执行或人工认证的页面。
+        """
         try:
             rule = rule_for(provider)
         except ProviderAutomationError as exc:
             raise ProtocolError(400, "Unsupported RPA provider", exc.code) from exc
-        # 保活使用独立临时 Tab，不能复用正在执行或人工认证的页面；账号 Context 仍由
-        # profileKey 隔离，避免 Cookie、IndexedDB 与 LocalStorage 跨账号串用。
+        session = self.sessions.get(profile_key)
+        if session is not None:
+            session.last_access = time.monotonic()
+            probed = await probe_browser_context(provider.value, session.context)
+            if probed != "uncertain":
+                return probed
         tab = await self.create_tab(profile_key, rule.entry_url)
         try:
             async with tab.lock:
                 return await provider_keepalive(tab.page, rule)
         finally:
-            await self._save_state(tab.session)
             await self.close_tab(tab)
 
     async def create_manual_session(
@@ -1348,7 +1448,7 @@ class BrowserService:
         window = self.windows.get(handle)
         if window is None or window.user_id != profile_key or window.kind != "manual":
             raise ProtocolError(404, "Manual session not found")
-        return await self._save_state(window.tab.session)
+        return await self._export_storage_state(window.tab.session) is not None
 
     async def _on_response(self, tab: TabState, response: PwResponse) -> None:
         for capture in list(tab.captures.values()):
@@ -1579,13 +1679,14 @@ async def submit_near(tab: TabState, target: Any) -> None:
 @app.get("/health")
 async def health() -> dict[str, Any]:
     running = service.browser is not None and service.browser.is_connected()
+    ready = service.browser_ready and running
     return {
         "ok": True,
         "engine": "camoufox",
         "geoRpaProtocolVersion": service.protocol_version,
         "browserConnected": running,
         "browserRunning": running,
-        "browserReady": service.browser_ready,
+        "browserReady": ready,
         "persistenceReady": service.persistence_ready,
         "activeTabs": service.tab_count,
         "activeSessions": len(service.sessions),
@@ -1660,6 +1761,28 @@ async def execution_preview(execution_id: str) -> Response:
 async def cancel_execution(execution_id: str) -> ExecutionPayload:
     try:
         return service.execution_payload(await service.cancel_execution(execution_id))
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
+
+
+@app.post("/rpa/accounts/session")
+async def hydrate_account_session(request: Request) -> BooleanPayload:
+    """Create or reuse an account Context from the GEO-owned login snapshot."""
+    try:
+        body = await parse_v4_request(request, AccountSessionHydrateRequest)
+        await service.hydrate_account_session(body.profile_key, body.storage_state)
+        return {"ok": True}
+    except ProtocolError as exc:
+        raise error_response(exc) from exc
+
+
+@app.post("/rpa/accounts/session/checkpoint")
+async def checkpoint_account_session(request: Request) -> AccountSessionCheckpointPayload:
+    """Export Cookie + LocalStorage for GEO to persist; never log the snapshot."""
+    try:
+        body = await parse_v4_request(request, ProfileKeyRequest)
+        state = await service.checkpoint_account_session(body.profile_key)
+        return {"ok": True, "storageState": state}
     except ProtocolError as exc:
         raise error_response(exc) from exc
 
@@ -1959,9 +2082,9 @@ async def checkpoint(tab_id: str, request: Request) -> dict[str, bool]:
     body = await request_object(request)
     try:
         async with tab_operation(require_string(body.get("userId"), "userId", 256), tab_id) as tab:
-            # 手工登录完成不能只依赖后续的空闲回收或 Context close。此处同步写回，
-            # 让认证接口在卷不可写、快照失败时明确失败，而不是误报认证成功。
-            if not await service._save_state(tab.session):
+            # 旧 tab checkpoint 仅验证当前 Context 可导出快照；GEO 必须走账号级 checkpoint 才会写库。
+            # 导出失败时明确返回 503，不能仅因页面仍显示已登录而报成功。
+            if await service._export_storage_state(tab.session) is None:
                 raise ProtocolError(503, "Camofox Browser could not persist the authenticated session")
         return {"ok": True}
     except ProtocolError as exc:

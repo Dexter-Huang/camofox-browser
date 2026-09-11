@@ -10,8 +10,7 @@ COPY --chown=node:node docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
 
 USER node
-ENV CAMOFOX_PROFILE_DIR=/home/node/.camofox/profiles \
-    CAMOFOX_PORT=9377
+ENV CAMOFOX_PORT=9377
 EXPOSE 9377
 EXPOSE 5900 6080
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

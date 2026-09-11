@@ -1,6 +1,6 @@
 # Camofox Browser Agent Guide
 
-本子模块是 GEO RPA protocol v3 的 Python sidecar，使用 FastAPI/Uvicorn 和
+本子模块是 GEO RPA protocol v4 的 Python sidecar，使用 FastAPI/Uvicorn 和
 `camoufox==0.5.5`、`playwright==1.59.0`。Node.js、npm、MCP、OpenClaw 插件和
 旧 JavaScript 服务已经废弃，不得恢复或新增运行时依赖。
 
@@ -19,9 +19,9 @@ docker build -t geo-camofox-browser:local .
 
 ## 运行边界
 
-- 对外只提供 `app/main.py` 中 GEO RPA protocol v3 所需的受限 HTTP 路由。
+- 对外只提供 `app/main.py` 中 GEO RPA protocol v4 所需的受限 HTTP 路由。
 - 不提供任意 JavaScript 执行、任意 URL/cookie/header、通用调试协议或 MCP 入口。
-- 账号状态仅使用 `sha256(userId)[:32]/storage-state.json`；该受限 Playwright StorageState 快照包含 Cookie、LocalStorage 与 IndexedDB，以保留平台登录令牌。不得导入或导出完整浏览器 profile、Sandbox/Chromium cookie。
+- 账号登录快照由 GEO `storageState` 持有；sidecar 仅在内存 Context 中使用 Cookie + LocalStorage，不得写入本地 profile volume，也不得导入完整 Firefox profile 或 Sandbox/Chromium cookie。
 - `ENABLE_WINDOW_PUBLISHER=true` 时才发布账号级 X11 窗口；共享桌面不能作为账号观察器暴露。
 - 关闭会话必须等待 teardown barrier，超时必须清理 Context 索引并重启受控浏览器。
 

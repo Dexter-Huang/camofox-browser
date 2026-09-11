@@ -10,24 +10,18 @@ cookie export, arbitrary request headers, or a general browser debugging API.
 
 ## Protocol and isolation
 
-`/health` always declares `geoRpaProtocolVersion=4`. Per-account state is
-stored only as `sha256(userId)[:32]/storage-state.json`. The controlled
-Playwright StorageState snapshot includes cookies, local storage, and
-IndexedDB so providers whose login token lives in IndexedDB survive a Context
-or Firefox restart. Complete Firefox profiles and Chromium/Sandbox cookies
+`/health` always declares `geoRpaProtocolVersion=4`. Per-account login snapshot
+is owned by GEO `RpaProviderAccount.storageState` and hydrated over `/rpa/accounts/session`. The snapshot contains cookies and local storage only. Complete Firefox profiles and Chromium/Sandbox cookies
 are never imported or exported.
 
 Closing a session first removes it from the public session map and installs one
 awaitable closing barrier for that user. New sessions wait for the barrier. A
 Context close timeout restarts the controlled browser and removes all stale
-Context indexes, preventing late pages from becoming ghost tabs or writing to
-the previous profile.
+Context indexes, preventing late pages from becoming ghost tabs or reusing a stale Context after restart.
 
-Manual authentication calls the controlled
-`POST /rpa/tabs/{tab_id}/checkpoint` route before its window is closed. The
-route synchronously writes the same IndexedDB-inclusive StorageState and
-returns an error if that write fails; an authentication UI must not report
-success merely because the page remains visibly logged in.
+GEO hydrates the account session from MySQL, then checkpoints Cookie + LocalStorage
+through `POST /rpa/accounts/session/checkpoint` before closing a manual window.
+A failed checkpoint must not be reported as a successful login.
 
 Set `ENABLE_WINDOW_PUBLISHER=true` to enable account-scoped X11 window
 publication. Without it, `/health` remains `browserReady=false`, so the
@@ -108,6 +102,6 @@ docker build --build-arg CAMOFOX_BROWSER_BASE_IMAGE=geo-camofox-browser-base:py3
 .venv/Scripts/python.exe -m pytest tests -q
 ```
 
-Do not switch the production Compose service until protocol, profile,
+Do not switch the production Compose service until protocol, login-snapshot,
 window-isolation, timeout-recovery, provider, and resource acceptance gates are
 complete with authorized test accounts.

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import json
 from pathlib import Path
+
+import asyncio
+import json
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -1405,47 +1405,70 @@ def test_x11_parser_returns_only_direct_root_children() -> None:
     assert top_level_window_ids(tree) == ["0x200007", "0x200010"]
 
 
-def test_profile_path_matches_node_persistence_layout(tmp_path: Path) -> None:
-    service = BrowserService()
-    service.profile_dir = tmp_path
-    user_id = "geo-rpa-deepseek-account-1"
+def test_hydrate_creates_context_from_storage_state() -> None:
+    """GEO snapshot is applied only when the account Context does not exist yet."""
 
-    assert service._state_path(user_id) == (
-        tmp_path / hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:32] / "storage-state.json"
-    )
+    async def run() -> None:
+        service = BrowserService()
+        browser = AsyncMock()
+        created = []
+
+        async def new_context(**kwargs):
+            created.append(kwargs)
+            return AsyncMock()
+
+        browser.new_context.side_effect = new_context
+        service.browser = browser
+        service.browser_ready = True
+        state = {"cookies": [{"name": "sid", "value": "1", "domain": "example.com", "path": "/"}]}
+        await service.hydrate_account_session("profile-key", state)
+        await service.hydrate_account_session("profile-key", {"cookies": []})
+        assert len(created) == 1
+        assert created[0]["storage_state"]["cookies"][0]["name"] == "sid"
+
+    asyncio.run(run())
 
 
-def test_invalid_state_is_quarantined(tmp_path: Path) -> None:
-    service = BrowserService()
-    service.profile_dir = tmp_path
-    state_path = service._state_path("user-1")
-    state_path.parent.mkdir(parents=True)
-    state_path.write_text("not-json", encoding="utf-8")
+def test_invalid_hydrate_snapshot_creates_logged_out_context() -> None:
+    """Illegal snapshots hydrate as an empty Context rather than failing closed."""
 
-    assert asyncio.run(service._load_state("user-1")) is None
-    assert not state_path.exists()
-    assert list(state_path.parent.glob("storage-state.invalid-*.json"))
+    async def run() -> None:
+        service = BrowserService()
+        browser = AsyncMock()
+        created = []
+
+        async def new_context(**kwargs):
+            created.append(kwargs)
+            return AsyncMock()
+
+        browser.new_context.side_effect = new_context
+        service.browser = browser
+        service.browser_ready = True
+        await service.hydrate_account_session("profile-key", {"cookies": "bad"})
+        assert created == [{}]
+
+    asyncio.run(run())
 
 
-def test_storage_state_checkpoint_excludes_indexed_db(tmp_path: Path) -> None:
-    """人工认证快照不请求 IndexedDB，避免 Firefox/Juggler 导出卡死。"""
+def test_checkpoint_returns_storage_state_without_indexed_db() -> None:
+    """Manual and task checkpoints export Cookie + LocalStorage only."""
 
     async def run() -> None:
         context = AsyncMock()
         context.storage_state.return_value = {"cookies": [], "origins": []}
         instance = BrowserService()
-        instance.profile_dir = tmp_path
-
-        assert await instance._save_state(SessionState(user_id="user-1", context=context)) is True
+        instance.sessions["user-1"] = SessionState(user_id="user-1", context=context)
+        state = await instance.checkpoint_account_session("user-1")
+        assert state == {"cookies": [], "origins": []}
         context.storage_state.assert_awaited_once_with(indexed_db=False)
 
     asyncio.run(run())
 
 
 def test_storage_state_checkpoint_times_out_without_blocking_shutdown(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Firefox 未响应 StorageState 时，认证完成接口必须在有限时间内失败。"""
+    """Firefox StorageState RPC hang must fail the checkpoint in bounded time."""
 
     async def run() -> None:
         context = AsyncMock()
@@ -1458,10 +1481,26 @@ def test_storage_state_checkpoint_times_out_without_blocking_shutdown(
 
         context.storage_state.side_effect = storage_state
         instance = BrowserService()
-        instance.profile_dir = tmp_path
         monkeypatch.setattr("app.main.STORAGE_STATE_TIMEOUT_SECONDS", 0.01)
+        assert await instance._export_storage_state(SessionState(user_id="user-1", context=context)) is None
 
-        assert await instance._save_state(SessionState(user_id="user-1", context=context)) is False
+    asyncio.run(run())
+
+
+def test_close_session_does_not_write_storage_state_files(tmp_path: Path) -> None:
+    """Idle recycle closes the Context without a local profile volume."""
+
+    async def run() -> None:
+        instance = BrowserService()
+        context = AsyncMock()
+        context.close = AsyncMock()
+        instance.sessions["user-1"] = SessionState(user_id="user-1", context=context)
+        await instance.close_session("user-1")
+        context.storage_state.assert_not_called()
+        assert list(tmp_path.glob("**/*")) == []
+
+    asyncio.run(run())
+
 
     asyncio.run(run())
 
@@ -1690,8 +1729,16 @@ def test_v4_task_routes_are_high_level_only() -> None:
         ("/rpa/executions/{execution_id}", "GET"),
         ("/rpa/executions/{execution_id}", "DELETE"),
         ("/rpa/accounts/keepalive", "POST"),
+        ("/rpa/accounts/session", "POST"),
+        ("/rpa/accounts/session/checkpoint", "POST"),
         ("/rpa/manual-sessions", "POST"),
     }.issubset(routes)
+
+
+def test_execution_create_schema_excludes_storage_state() -> None:
+    schema = ExecutionCreateRequest.model_json_schema(by_alias=True)
+    assert "storageState" not in schema.get("properties", {})
+    assert "profileKey" in schema.get("properties", {})
 
 
 def test_vnc_environment_parser_is_explicit_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1781,5 +1828,34 @@ def test_session_for_waits_for_the_existing_close_barrier() -> None:
         release.set()
         await barrier
         await waiter
+
+    asyncio.run(run())
+
+
+def test_session_for_schedules_browser_recovery_after_target_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """浏览器子进程被 OOM Killer 终止后，下一次请求应触发 sidecar 自愈。"""
+
+    class DisconnectedBrowser:
+        def is_connected(self) -> bool:
+            return False
+
+        async def new_context(self, **_: object) -> object:
+            raise RuntimeError("Browser.new_context: Target ... browser has been closed")
+
+    async def run() -> None:
+        instance = BrowserService()
+        instance.browser = DisconnectedBrowser()  # type: ignore[assignment]
+        instance.browser_ready = True
+        restart = AsyncMock()
+        monkeypatch.setattr(instance, "_restart_browser", restart)
+
+        with pytest.raises(ProtocolError, match="could not create a session"):
+            await instance.session_for("user-oom")
+
+        await asyncio.sleep(0)
+        restart.assert_awaited_once()
+        assert instance.browser_ready is False
 
     asyncio.run(run())
