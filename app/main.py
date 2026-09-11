@@ -1398,11 +1398,11 @@ class BrowserService:
     async def account_keepalive(
         self, provider: ProviderName, profile_key: str
     ) -> Literal["ok", "login_required", "verification_required", "uncertain"]:
-        """优先用已 hydrate 的 Context 打平台用户接口，无法判定时再开临时页。
+        """优先用已 hydrate 的 Context 打平台用户接口；ok 与 verification_required 直接返回。
 
         平台 URL 与业务码判定留在 sidecar。调用方仍然只传 provider 与 profileKey，
-        只收回稳定账号状态。接口探活不新开 Tab；页面保活仍用独立临时页，避免覆盖
-        正在执行或人工认证的页面。
+        只收回稳定账号状态。接口探活不新开 Tab。login_required 与 uncertain 再开独立
+        临时页做页面保活，避免覆盖正在执行或人工认证的页面，也避免接口漏带鉴权时误隔离。
         """
         try:
             rule = rule_for(provider)
@@ -1412,7 +1412,9 @@ class BrowserService:
         if session is not None:
             session.last_access = time.monotonic()
             probed = await probe_browser_context(provider.value, session.context)
-            if probed != "uncertain":
+            # HTTP 明确在线或需要人工验证时不再开页。login_required 仍回退页面保活，
+            # 避免接口漏带 Cookie/Token 时把仍可编辑的会话误判为掉线。
+            if probed in {"ok", "verification_required"}:
                 return probed
         tab = await self.create_tab(profile_key, rule.entry_url)
         try:

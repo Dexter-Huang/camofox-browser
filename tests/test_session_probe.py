@@ -173,3 +173,67 @@ def test_keepalive_falls_back_to_page_when_probe_uncertain() -> None:
         service.close_tab.assert_awaited_once_with(tab)
 
     asyncio.run(run())
+
+def test_keepalive_falls_back_to_page_when_probe_login_required() -> None:
+    """DeepSeek 接口 Missing Token 不能直接隔离；页面仍可编辑时以页面为准。"""
+
+    async def run() -> None:
+        service = BrowserService()
+        context = AsyncMock()
+        context.cookies = AsyncMock(
+            return_value=[
+                {"name": "ds_session_id", "value": "alive", "domain": "chat.deepseek.com"}
+            ]
+        )
+        response = AsyncMock()
+        response.status = 200
+        response.text = AsyncMock(
+            return_value='{"code":40002,"msg":"Missing Token","data":null}'
+        )
+        context.request.fetch = AsyncMock(return_value=response)
+        service.sessions["profile-key"] = SessionState(user_id="profile-key", context=context)
+        tab = Mock()
+        tab.lock = _AsyncNullLock()
+        tab.page = Mock()
+        service.create_tab = AsyncMock(return_value=tab)
+        service.close_tab = AsyncMock()
+        with patch("app.main.provider_keepalive", new=AsyncMock(return_value="ok")) as page_keepalive:
+            status = await service.account_keepalive(ProviderName.DEEPSEEK, "profile-key")
+        assert status == "ok"
+        service.create_tab.assert_awaited_once()
+        page_keepalive.assert_awaited_once()
+        service.close_tab.assert_awaited_once_with(tab)
+
+    asyncio.run(run())
+
+
+def test_keepalive_page_can_confirm_login_required() -> None:
+    async def run() -> None:
+        service = BrowserService()
+        context = AsyncMock()
+        context.cookies = AsyncMock(
+            return_value=[
+                {"name": "ds_session_id", "value": "stale", "domain": "chat.deepseek.com"}
+            ]
+        )
+        response = AsyncMock()
+        response.status = 200
+        response.text = AsyncMock(
+            return_value='{"code":40002,"msg":"Missing Token","data":null}'
+        )
+        context.request.fetch = AsyncMock(return_value=response)
+        service.sessions["profile-key"] = SessionState(user_id="profile-key", context=context)
+        tab = Mock()
+        tab.lock = _AsyncNullLock()
+        tab.page = Mock()
+        service.create_tab = AsyncMock(return_value=tab)
+        service.close_tab = AsyncMock()
+        with patch(
+            "app.main.provider_keepalive",
+            new=AsyncMock(return_value="login_required"),
+        ):
+            status = await service.account_keepalive(ProviderName.DEEPSEEK, "profile-key")
+        assert status == "login_required"
+        service.create_tab.assert_awaited_once()
+
+    asyncio.run(run())
