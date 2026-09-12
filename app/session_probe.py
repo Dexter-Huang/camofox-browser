@@ -251,7 +251,7 @@ def _build_headers(
 async def probe_browser_context(
     provider: str, context: BrowserContext
 ) -> KeepaliveStatus:
-    """用 Context 里的 Cookie 打平台接口；无法判定时返回 uncertain 以便回退页面保活。"""
+    """用 Context 里的 Cookie 打平台用户接口；无法判定时返回 uncertain。"""
     spec = SESSION_PROBE_SPECS.get(provider)
     if spec is None:
         return "uncertain"

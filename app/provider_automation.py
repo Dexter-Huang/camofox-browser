@@ -1707,14 +1707,44 @@ async def wait_result(
     raise ProviderAutomationError("answer_timeout", "Provider answer did not become stable")
 
 
+_LOGIN_CTA_NAMES = ("登录", "Log in", "Sign in")
+
+
+async def _visible_login_cta(page: Page) -> bool:
+    """识别页眉上的登录按钮/链接。
+
+    豆包游客壳也有可编辑输入框，不能只凭输入框判断已登录。已登录页通常是头像，
+    不能用正文里偶然出现的「登录」二字。
+    """
+    for role in ("button", "link"):
+        for name in _LOGIN_CTA_NAMES:
+            locator = page.get_by_role(role, name=name, exact=True)
+            try:
+                count = await locator.count()
+            except Exception:
+                continue
+            for index in range(min(count, 8)):
+                try:
+                    if await locator.nth(index).is_visible():
+                        return True
+                except Exception:
+                    continue
+    return False
+
+
 async def keepalive(
     page: Page, rule: ProviderRule
 ) -> Literal["ok", "login_required", "verification_required", "uncertain"]:
     """只读确认账号能否获得可编辑输入控件。"""
     await page.goto(rule.entry_url, wait_until="domcontentloaded", timeout=45_000)
+    login_cta = await _visible_login_cta(page)
     try:
         prompt = await _first_visible(page, rule.prompt_selectors, 15_000)
+        if login_cta:
+            return "login_required"
         return "ok" if await prompt.is_editable() else "uncertain"
     except ProviderAutomationError:
+        if login_cta:
+            return "login_required"
         text = (await page.locator("body").inner_text(timeout=5_000)).casefold()
         return "login_required" if any(marker in text for marker in ("登录", "log in", "sign in")) else "uncertain"

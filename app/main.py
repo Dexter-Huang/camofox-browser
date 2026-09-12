@@ -41,7 +41,6 @@ from app.provider_automation import (
     ProviderAutomationError,
     ProviderName,
     conversation_url,
-    keepalive as provider_keepalive,
     prepare as prepare_provider,
     rule_for,
     submit as submit_provider,
@@ -1398,30 +1397,21 @@ class BrowserService:
     async def account_keepalive(
         self, provider: ProviderName, profile_key: str
     ) -> Literal["ok", "login_required", "verification_required", "uncertain"]:
-        """优先用已 hydrate 的 Context 打平台用户接口；ok 与 verification_required 直接返回。
+        """只用已 hydrate 的 Context 打平台用户接口，不打开聊天页。
 
-        平台 URL 与业务码判定留在 sidecar。调用方仍然只传 provider 与 profileKey，
-        只收回稳定账号状态。接口探活不新开 Tab。login_required 与 uncertain 再开独立
-        临时页做页面保活，避免覆盖正在执行或人工认证的页面，也避免接口漏带鉴权时误隔离。
+        平台 URL 与业务码判定留在 sidecar。调用方仍然只传 provider 与 profileKey。
+        豆包等首页加载很慢，页面保活还会把游客输入框误判为在线，因此不再回退开页。
+        没有 Context 或接口无法判定时返回 uncertain，由调度侧决定是否重试。
         """
         try:
-            rule = rule_for(provider)
+            rule_for(provider)
         except ProviderAutomationError as exc:
             raise ProtocolError(400, "Unsupported RPA provider", exc.code) from exc
         session = self.sessions.get(profile_key)
-        if session is not None:
-            session.last_access = time.monotonic()
-            probed = await probe_browser_context(provider.value, session.context)
-            # HTTP 明确在线或需要人工验证时不再开页。login_required 仍回退页面保活，
-            # 避免接口漏带 Cookie/Token 时把仍可编辑的会话误判为掉线。
-            if probed in {"ok", "verification_required"}:
-                return probed
-        tab = await self.create_tab(profile_key, rule.entry_url)
-        try:
-            async with tab.lock:
-                return await provider_keepalive(tab.page, rule)
-        finally:
-            await self.close_tab(tab)
+        if session is None:
+            return "uncertain"
+        session.last_access = time.monotonic()
+        return await probe_browser_context(provider.value, session.context)
 
     async def create_manual_session(
         self, provider: ProviderName, profile_key: str
