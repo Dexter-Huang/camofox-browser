@@ -3,8 +3,8 @@
 此服务是现有 ``backend.app.rpa.camofox_browser`` 的受限 HTTP adapter。它不提供
 通用 evaluate、浏览器调试端口或任意网络请求能力；所有操作都必须归属到一个已知
 ``userId`` 的 tab。账号状态沿用 Node sidecar 的 StorageState 文件布局，方便 PoC
-复用同一个 Docker volume 而不迁移 Chromium 数据。服务始终声明 v3；部署显式启用
-``ENABLE_WINDOW_PUBLISHER=1`` 后，窗口路由才会验证并发布 X11 单窗口。
+复用同一个 Docker volume 而不迁移 Chromium 数据。服务始终声明 protocol v4。默认 headed Firefox 只依赖 Xvfb，不再发布
+窗口级 VNC；``ENABLE_WINDOW_PUBLISHER=1`` 仅保留给未删除的窗口路由。
 """
 
 from __future__ import annotations
@@ -439,7 +439,8 @@ class BrowserService:
         self.browser_ready = False
         self.background_tasks: list[asyncio.Task[None]] = []
         self.vnc_enabled = env_flag("ENABLE_VNC")
-        # 整桌面 VNC 仅供旧调试用途。v3 只在独立窗口发布器可用时对后端声明。
+        self.xvfb_enabled = env_flag("ENABLE_XVFB")
+        # 窗口级 VNC 发布器已弃用；默认 headed 自动化只使用 Xvfb。
         self.window_publisher_enabled = env_flag("ENABLE_WINDOW_PUBLISHER")
         self.x11_display = os.getenv("CAMOFOX_VNC_DISPLAY", ":99")
         self.persistence_ready = False
@@ -468,19 +469,12 @@ class BrowserService:
 
     async def start(self) -> None:
         self._shutting_down = False
-        # A v4 sidecar must provide account-scoped native windows. Advertising a
-        # ready browser without the publisher would let the backend accept an
-        # incomplete deployment, so keep readiness false until it is explicit.
-        if not self.window_publisher_enabled:
-            logger.error("Window publisher must be enabled for GEO RPA protocol v4")
-            return
         # Dockerfile has already installed the pinned official Camoufox release
         # into this service account's package-manager cache.  Excluding the
         # default UBO addon ensures startup never reaches the network.
         self._camoufox = AsyncCamoufox(
-            # 全桌面调试和 v3 窗口发布均复用 entrypoint 创建的同一 Xvfb；
-            # 普通自动化实例继续以 headless 模式运行，避免额外 X11 开销。
-            headless=not (self.vnc_enabled or self.window_publisher_enabled),
+            # headed 实例复用 entrypoint 创建的 Xvfb；未启用显示时才走 headless。
+            headless=not (self.vnc_enabled or self.window_publisher_enabled or self.xvfb_enabled),
             exclude_addons=list(DefaultAddons),
         )
         try:

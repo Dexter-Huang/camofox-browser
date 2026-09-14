@@ -1,7 +1,7 @@
 # Camofox Browser 独立部署。日常在本目录执行 docker compose up -d。
 # 无 .env 时默认绑定 127.0.0.1:9377。不要使用仓库根目录 .env.deploy 作为本目录 env-file。
 # GEO 同机 app 使用 CAMOFOX_BROWSER_URL=http://host.docker.internal:9377，不能写 127.0.0.1。
-# 禁止把 REST、RFB、WS 暴露到公网。
+# 禁止把 REST 暴露到公网。不再映射 RFB/noVNC 端口。
 #
 # 镜像已存在：
 #   docker compose up -d
@@ -35,18 +35,15 @@ services:
       SESSION_TIMEOUT_MS: "300000"
       TAB_INACTIVITY_MS: "300000"
       TZ: ${CAMOFOX_TIMEZONE:-Asia/Shanghai}
-      ENABLE_WINDOW_PUBLISHER: "true"
+      ENABLE_WINDOW_PUBLISHER: "false"
+      ENABLE_VNC: "false"
+      ENABLE_XVFB: "true"
       CAMOFOX_VNC_DISPLAY: ":99"
       CAMOFOX_VNC_RESOLUTION: ${CAMOFOX_VNC_RESOLUTION:-1920x1080x24}
       VNC_RESOLUTION: ${CAMOFOX_VNC_RESOLUTION:-1920x1080x24}
-      WINDOW_PUBLISHER_GRID_COLUMNS: ${RPA_WINDOW_PUBLISHER_GRID_COLUMNS:-5}
     ports:
       # 控制面 API。app 使用 http://<CAMOFOX_BIND_ADDRESS>:<CAMOFOX_CONTROL_HOST_PORT>
       - "${CAMOFOX_BIND_ADDRESS:-127.0.0.1}:${CAMOFOX_CONTROL_HOST_PORT:-9377}:9377"
-      # 人工 VNC RFB。app 连同一 IP 和 sidecar 返回的 rfbPort
-      - "${CAMOFOX_BIND_ADDRESS:-127.0.0.1}:${CAMOFOX_RFB_HOST_PORT_START:-5902}-${CAMOFOX_RFB_HOST_PORT_END:-5931}:5902-5931"
-      # 任务观察 websockify。app 连同一 IP 和 sidecar 返回的 websocketPort
-      - "${CAMOFOX_BIND_ADDRESS:-127.0.0.1}:${CAMOFOX_WS_HOST_PORT_START:-6082}-${CAMOFOX_WS_HOST_PORT_END:-6111}:6082-6111"
     healthcheck:
       test:
         [

@@ -23,27 +23,12 @@ GEO hydrates the account session from MySQL, then checkpoints Cookie + LocalStor
 through `POST /rpa/accounts/session/checkpoint` before closing a manual window.
 A failed checkpoint must not be reported as a successful login.
 
-Set `ENABLE_WINDOW_PUBLISHER=true` to enable account-scoped X11 window
-publication. Without it, `/health` remains `browserReady=false`, so the
-backend cannot accept an incomplete v4 deployment. A shared desktop is never
-presented as an account-scoped observer.
-
-Each manual authentication window is published through its own internal
-`x11vnc` RFB TCP listener. The GEO application connects to that listener over
-the Docker network and relays RFB bytes through its authenticated same-origin
-WebSocket, so manual windows do not start a per-window Uvicorn/WebSocket
-bridge. `MAX_MANUAL_WINDOWS=0` (the Compose default) means no manual-window
-hard limit; a positive value bounds concurrent manual windows and is derived
-from `RPA_MANUAL_SESSION_MAX_CONCURRENT`. The browser client never receives an
-RFB port or X11 window identifier.
-
-Window publishers share one Firefox process and one X11 display, but their
-native windows must not overlap: `x11vnc -id` cannot reliably read pixels from
-an obscured top-level window. The entrypoint expands Xvfb into a bounded grid
-derived from `VNC_RESOLUTION`, `MAX_TABS_GLOBAL`, and
-`WINDOW_PUBLISHER_GRID_COLUMNS`; manual and task windows reserve and reuse one
-grid slot each. Only the selected window is published, never the expanded root
-desktop.
+Default Compose starts headed Firefox on a private Xvfb display and publishes
+only `127.0.0.1:9377`. Window-level VNC is deprecated: do not map RFB/noVNC
+ports, and do not install `x11vnc` or noVNC into the image. GEO manual
+authentication and task observation use tab screenshots over the authenticated
+application WebSocket. `ENABLE_WINDOW_PUBLISHER` remains off unless a leftover
+window route is explicitly being tested.
 
 ## Authorized interaction pacing
 

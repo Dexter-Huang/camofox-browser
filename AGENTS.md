@@ -23,15 +23,15 @@ docker compose --env-file .env up -d --no-build camofox-browser
 - 对外只提供 `app/main.py` 中 GEO RPA protocol v4 所需的受限 HTTP 路由。
 - 不提供任意 JavaScript 执行、任意 URL/cookie/header、通用调试协议或 MCP 入口。
 - 账号登录快照由 GEO `storageState` 持有；sidecar 仅在内存 Context 中使用 Cookie + LocalStorage，不得写入本地 profile volume，也不得导入完整 Firefox profile 或 Sandbox/Chromium cookie。
-- `ENABLE_WINDOW_PUBLISHER=true` 时才发布账号级 X11 窗口；共享桌面不能作为账号观察器暴露。
+- 默认 `ENABLE_XVFB=true` 为 headed Firefox 提供私有显示；不要安装或映射 x11vnc/noVNC。
 - 关闭会话必须等待 teardown barrier，超时必须清理 Context 索引并重启受控浏览器。
 
 ## 文件边界
 
-- `app/`：FastAPI 路由、Camoufox 生命周期、noVNC 和窗口发布实现。
+- `app/`：FastAPI 路由、Camoufox 生命周期和协议实现。
 - `docker-compose.yaml`：浏览器服务器独立部署。
-- `docker-entrypoint.sh`：可选 Xvfb/x11vnc/noVNC 进程树和 Uvicorn 启动。
-- `tests/*.py`：Python 协议、预热和 VNC 检查。
+- `docker-entrypoint.sh`：可选 Xvfb 与 Uvicorn 启动。
+- `tests/*.py`：Python 协议与预热检查。
 - `bin/`：由维护者预置并审核的浏览器归档包，不提交到 Git。
 
 修改协议或安全边界时，必须同步更新 `README.md`、主仓库部署文档和 Python 测试。

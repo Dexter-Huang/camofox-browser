@@ -811,6 +811,50 @@ def _yuanbao_answer_from_payload(payload: str) -> str:
     return _YUANBAO_ANNOTATION_MARK_PATTERN.sub("", answer)
 
 
+_DEEPSEEK_PROGRESS_LINE_PATTERN = re.compile(
+    r"^(?:(?:Found|Read)\s+\d+\s+web\s+pages?|DeepThink)$",
+    re.IGNORECASE,
+)
+
+
+def _strip_deepseek_progress(text: str) -> str:
+    """去掉 DeepSeek 检索/推理面板的单行进度，避免其单独落成回答。"""
+
+    lines = text.splitlines()
+    while lines and (
+        not lines[0].strip()
+        or _DEEPSEEK_PROGRESS_LINE_PATTERN.fullmatch(lines[0].strip())
+    ):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def _deepseek_response_fragment_texts(value: object) -> list[str]:
+    """提取 BATCH 中的 RESPONSE 片段，兼容扁平与 fragments 嵌套两种补丁。"""
+
+    if not isinstance(value, list):
+        return []
+    texts: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "RESPONSE" and isinstance(item.get("content"), str):
+            texts.append(item["content"])
+            continue
+        if item.get("p") != "fragments":
+            continue
+        fragments = item.get("v")
+        if not isinstance(fragments, list):
+            continue
+        for fragment in fragments:
+            if not isinstance(fragment, dict) or fragment.get("type") != "RESPONSE":
+                continue
+            content = fragment.get("content")
+            if isinstance(content, str) and content:
+                texts.append(content)
+    return texts
+
+
 def _deepseek_answer_from_payload(payload: str) -> str:
     """重建 DeepSeek JSON Patch SSE 的 RESPONSE 片段，排除搜索进度。"""
     fragments: list[str] = []
@@ -828,12 +872,10 @@ def _deepseek_answer_from_payload(payload: str) -> str:
         if isinstance(event.get("o"), str):
             operation = event["o"]
         if path == "response" and operation == "BATCH" and isinstance(event.get("v"), list):
-            for item in event["v"]:
-                if isinstance(item, dict) and item.get("type") == "RESPONSE" and isinstance(item.get("content"), str):
-                    fragments.append(item["content"])
+            fragments.extend(_deepseek_response_fragment_texts(event["v"]))
         elif path == "response/fragments/-1/content" and operation in {"APPEND", "SET"} and isinstance(event.get("v"), str):
             fragments.append(event["v"])
-    return _merge_stream_fragments(fragments)
+    return _strip_deepseek_progress(_merge_stream_fragments(fragments))
 
 
 def _doubao_content_block_texts(value: object) -> list[str]:
@@ -1389,7 +1431,10 @@ def extract_answer_text(
     """
 
     if rule.answer_extraction is AnswerExtractionMode.DIRECT_TEXT:
-        return raw_text.strip()
+        text = raw_text.strip()
+        if rule.provider is ProviderName.DEEPSEEK:
+            return _strip_deepseek_progress(text)
+        return text
     if rule.answer_extraction is AnswerExtractionMode.DOUBAO_MAIN_CONVERSATION:
         boundary = _DOUBAO_REFERENCE_METADATA_PATTERN.search(raw_text)
         if boundary is not None:

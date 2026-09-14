@@ -337,6 +337,44 @@ def test_network_answer_uses_yuanbao_text_events_only() -> None:
     assert _network_answer_from_payload(payload, policy) == "## 正式回答\n\n第一段\n\n- 第二项建议"
 
 
+def test_deepseek_network_answer_ignores_search_progress() -> None:
+    """DeepSeek 检索进度即使被写成 RESPONSE，也不能单独作为最终回答。"""
+
+    payload = "\n".join(
+        (
+            'data: {"p":"response","o":"BATCH","v":[{"p":"fragments","o":"APPEND","v":[{"type":"SEARCH","content":"Found 10 web pages"},{"type":"RESPONSE","content":"Found 10 web pages"}]}]}',
+            'data: {"p":"response/fragments/-1/status","v":"FINISHED"}',
+        )
+    )
+    policy = rule_for("deepseek").network_answer
+    assert policy is not None
+    assert _network_answer_from_payload(payload, policy) == ""
+
+
+def test_deepseek_network_answer_keeps_real_response_after_search_progress() -> None:
+    """检索进度后的 RESPONSE 增量必须保留为助手正文。"""
+
+    payload = "\n".join(
+        (
+            'data: {"p":"response","o":"BATCH","v":[{"p":"fragments","o":"APPEND","v":[{"type":"SEARCH","content":"Found 10 web pages"},{"type":"RESPONSE","content":"Found 10 web pages"}]}]}',
+            'data: {"p":"response/fragments/-1/content","o":"APPEND","v":"\\n\\n## 正式回答\\n\\n这是面向用户的完整模型回答。"}',
+        )
+    )
+    policy = rule_for("deepseek").network_answer
+    assert policy is not None
+    assert _network_answer_from_payload(payload, policy) == "## 正式回答\n\n这是面向用户的完整模型回答。"
+
+
+def test_deepseek_extract_answer_text_strips_found_web_pages() -> None:
+    """DOM 兜底也必须丢掉检索进度行，否则会在 8 秒静默后提前收口。"""
+
+    assert extract_answer_text(rule_for("deepseek"), "Found 10 web pages") == ""
+    assert extract_answer_text(
+        rule_for("deepseek"),
+        "Found 10 web pages\n\n## 正式回答\n\n这是完整的模型回答。",
+    ) == "## 正式回答\n\n这是完整的模型回答。"
+
+
 def test_network_answer_uses_only_doubao_assistant_content_blocks() -> None:
     """豆包同流中的用户文本和推荐字段不能进入最终 Markdown。"""
 
@@ -1383,15 +1421,16 @@ def test_manual_window_creation_is_bounded_without_limiting_online_windows(
     asyncio.run(run())
 
 
-def test_v4_sidecar_is_not_ready_without_the_window_publisher(
+def test_v4_sidecar_does_not_require_window_publisher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("ENABLE_WINDOW_PUBLISHER", raising=False)
+    monkeypatch.setenv("ENABLE_XVFB", "true")
 
     instance = BrowserService()
-    asyncio.run(instance.start())
 
-    assert instance.browser_ready is False
+    assert instance.window_publisher_enabled is False
+    assert instance.xvfb_enabled is True
 
 
 def test_x11_parser_returns_only_direct_root_children() -> None:

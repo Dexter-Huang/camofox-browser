@@ -12,6 +12,5 @@ RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
 USER node
 ENV CAMOFOX_PORT=9377
 EXPOSE 9377
-EXPOSE 5900 6080
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9377"]

@@ -29,7 +29,7 @@ RUN sed -i \
         libgtk-3-0 libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 \
         libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 \
         fonts-liberation fonts-noto-color-emoji fontconfig \
-        xvfb x11vnc novnc python3-websockify x11-utils \
+        xvfb x11-utils \
     && pip install --no-cache-dir --index-url https://pypi.tuna.tsinghua.edu.cn/simple uv==0.12.1 \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone \
@@ -51,15 +51,6 @@ RUN echo "1bea4b55a51c88e82dc7d426d9c75093d942d2afc8c911cb8fc78ebf723d686c  /tmp
     && touch /home/node/.cache/camoufox/.0.5_FLAG \
     && chmod -R 755 /home/node/.cache/camoufox \
     && rm /tmp/camoufox.zip
-
-# Debian 的 novnc 仅提供静态页面，运行期桥接由 app.novnc 承担。
-RUN mkdir -p /app/novnc \
-    && cp -a /usr/share/novnc/. /app/novnc/ \
-    && apt-get purge -y --auto-remove novnc python3-websockify nodejs \
-    && rm -rf /var/lib/apt/lists/* \
-    && ! command -v node \
-    && ! command -v nodejs \
-    && ! command -v websockify
 
 RUN useradd --create-home --uid 1000 node \
     && mkdir -p /home/node/.camofox/profiles \
