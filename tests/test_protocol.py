@@ -358,11 +358,58 @@ def test_deepseek_network_answer_keeps_real_response_after_search_progress() -> 
         (
             'data: {"p":"response","o":"BATCH","v":[{"p":"fragments","o":"APPEND","v":[{"type":"SEARCH","content":"Found 10 web pages"},{"type":"RESPONSE","content":"Found 10 web pages"}]}]}',
             'data: {"p":"response/fragments/-1/content","o":"APPEND","v":"\\n\\n## 正式回答\\n\\n这是面向用户的完整模型回答。"}',
+            'data: {"p":"response/status","o":"SET","v":"FINISHED"}',
         )
     )
     policy = rule_for("deepseek").network_answer
     assert policy is not None
     assert _network_answer_from_payload(payload, policy) == "## 正式回答\n\n这是面向用户的完整模型回答。"
+
+
+def test_deepseek_network_answer_merges_response_content_d_field() -> None:
+    """新版 DeepSeek 流使用 p=response/content 的 d 字段增量。"""
+
+    payload = "\n".join(
+        (
+            'data: {"p":"response/content","d":"目前主流靠谱的折叠屏，"}',
+            'data: {"d":"后半段选择建议以及完整购买决策。"}',
+            'data: {"p":"response/status","o":"SET","v":"FINISHED"}',
+        )
+    )
+    policy = rule_for("deepseek").network_answer
+    assert policy is not None
+    assert (
+        _network_answer_from_payload(payload, policy)
+        == "目前主流靠谱的折叠屏，后半段选择建议以及完整购买决策。"
+    )
+
+
+def test_deepseek_network_answer_rejects_truncated_stream_without_finished() -> None:
+    """没有 FINISHED/close 的起始包不能当成完整网络答案。"""
+
+    payload = "\n".join(
+        (
+            'data: {"p":"response","o":"BATCH","v":[{"p":"fragments","o":"APPEND","v":[{"type":"RESPONSE","content":"目前主流靠谱的折叠屏"}]}]}',
+            'data: {"p":"response/fragments/-1/content","o":"APPEND","v":"第一段"}',
+        )
+    )
+    policy = rule_for("deepseek").network_answer
+    assert policy is not None
+    assert _network_answer_from_payload(payload, policy) == ""
+
+
+def test_deepseek_network_answer_rejects_truncated_response_content_d_field() -> None:
+    """d 字段起始包即使已经超过最短长度，没有 FINISHED 也不能交付。"""
+
+    payload = "\n".join(
+        (
+            'data: {"p":"response/content","d":"目前主流靠谱的折叠屏，"}',
+            'data: {"d":"后半段选择建议以及完整购买决策。"}',
+        )
+    )
+    policy = rule_for("deepseek").network_answer
+    assert policy is not None
+    assert _network_answer_from_payload(payload, policy) == ""
 
 
 def test_deepseek_extract_answer_text_strips_found_web_pages() -> None:

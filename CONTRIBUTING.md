@@ -17,5 +17,5 @@ Docker 构建需要维护者预置的浏览器归档包：
 docker build -t geo-camofox-browser:local .
 ```
 
-提交前确认镜像没有 Node/npm，服务仍通过 Uvicorn 暴露 protocol v3，并且不把
+提交前确认镜像没有 Node/npm，服务仍通过 Uvicorn 暴露 protocol v4，并且不把
 归档包、profile、凭据或运行日志加入 Git。

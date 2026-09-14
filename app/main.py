@@ -1500,7 +1500,7 @@ async def http_exception_response(_: Request, error: HTTPException) -> JSONRespo
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_response(_: Request, __: RequestValidationError) -> JSONResponse:
-    """FastAPI 默认 422 的 ``detail`` 结构不属于 GEO RPA v3 协议。"""
+    """FastAPI 默认 422 的 ``detail`` 结构不属于 GEO RPA v4 协议。"""
     return JSONResponse(status_code=400, content={"error": "Request parameters are invalid"})
 
 

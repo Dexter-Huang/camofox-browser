@@ -855,8 +855,78 @@ def _deepseek_response_fragment_texts(value: object) -> list[str]:
     return texts
 
 
+_DEEPSEEK_CONTENT_PATHS = frozenset(
+    {
+        "response/fragments/-1/content",
+        "response/content",
+    }
+)
+_DEEPSEEK_FINISHED_STATUS_PATHS = frozenset(
+    {
+        "response/status",
+        "response/fragments/-1/status",
+    }
+)
+_DEEPSEEK_CLOSE_EVENT_PATTERN = re.compile(r"(?m)^event:\s*close\s*$")
+
+
+def _deepseek_content_delta(event: dict, path: str | None, operation: str | None) -> str | None:
+    """提取当前事件中的助手正文增量，兼容 JSON Patch 的 v 和新版 d 字段。"""
+
+    if path not in _DEEPSEEK_CONTENT_PATHS:
+        return None
+    delta = event.get("d")
+    if isinstance(delta, str) and delta:
+        return delta
+    if operation in {"APPEND", "SET"}:
+        value = event.get("v")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _deepseek_event_is_finished(event: dict, path: str | None, operation: str | None) -> bool:
+    """判断单条 SSE 事件是否表示完成流已结束。"""
+
+    value = event.get("v")
+    if path in _DEEPSEEK_FINISHED_STATUS_PATHS and value == "FINISHED":
+        return True
+    if path == "response" and operation == "BATCH" and isinstance(value, list):
+        for item in value:
+            if (
+                isinstance(item, dict)
+                and item.get("p") == "quasi_status"
+                and item.get("v") == "FINISHED"
+            ):
+                return True
+    return False
+
+
+def _deepseek_stream_is_finished(payload: str) -> bool:
+    """完整 DeepSeek 流必须看到 FINISHED 或 SSE close，避免把截断的第一段当最终答案。"""
+
+    if _DEEPSEEK_CLOSE_EVENT_PATTERN.search(payload):
+        return True
+    path: str | None = None
+    operation: str | None = None
+    for raw_event in _SSE_DATA_PATTERN.findall(payload):
+        try:
+            event = json.loads(raw_event)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if isinstance(event.get("p"), str):
+            path = event["p"]
+        if isinstance(event.get("o"), str):
+            operation = event["o"]
+        if _deepseek_event_is_finished(event, path, operation):
+            return True
+    return False
+
+
 def _deepseek_answer_from_payload(payload: str) -> str:
-    """重建 DeepSeek JSON Patch SSE 的 RESPONSE 片段，排除搜索进度。"""
+    """重建 DeepSeek JSON Patch / response.content SSE 的 RESPONSE 正文，排除检索进度。"""
     fragments: list[str] = []
     path: str | None = None
     operation: str | None = None
@@ -873,8 +943,10 @@ def _deepseek_answer_from_payload(payload: str) -> str:
             operation = event["o"]
         if path == "response" and operation == "BATCH" and isinstance(event.get("v"), list):
             fragments.extend(_deepseek_response_fragment_texts(event["v"]))
-        elif path == "response/fragments/-1/content" and operation in {"APPEND", "SET"} and isinstance(event.get("v"), str):
-            fragments.append(event["v"])
+            continue
+        delta = _deepseek_content_delta(event, path, operation)
+        if delta is not None:
+            fragments.append(delta)
     return _strip_deepseek_progress(_merge_stream_fragments(fragments))
 
 
@@ -1017,6 +1089,8 @@ def _network_answer_from_payload(payload: str, policy: NetworkAnswerPolicy) -> s
         answer = _doubao_answer_from_payload(payload)
     elif policy.parser is NetworkAnswerParser.DEEPSEEK_CONTENT_EVENT:
         answer = _deepseek_answer_from_payload(payload)
+        if not _deepseek_stream_is_finished(payload):
+            answer = ""
     elif policy.parser is NetworkAnswerParser.QIANWEN_IFRAME_EVENT:
         answer = _qianwen_answer_from_payload(payload)
     elif policy.parser is NetworkAnswerParser.YUANBAO_TEXT_EVENT:
