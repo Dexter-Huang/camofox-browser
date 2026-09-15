@@ -46,7 +46,11 @@ from app.provider_automation import (
     submit as submit_provider,
     wait_result,
 )
-from app.session_probe import probe_browser_context
+from app.session_probe import (
+    ORIGIN_LOCAL_STORAGE_UPDATES_ATTR,
+    merge_origin_local_storage,
+    probe_browser_context,
+)
 from app.window_vnc import (
     WindowPublisher,
     read_x11_window_tree,
@@ -98,6 +102,8 @@ MAX_MANUAL_WINDOWS = int(os.getenv("MAX_MANUAL_WINDOWS", "0"))
 MAX_TABS_PER_SESSION = int(os.getenv("MAX_TABS_PER_SESSION", "3"))
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", os.getenv("RPA_BROWSER_CAPACITY", "30")))
 MAX_TABS_GLOBAL = int(os.getenv("MAX_TABS_GLOBAL", os.getenv("RPA_BROWSER_CAPACITY", "30")))
+# 只回收 GEO 崩溃后没关掉的泄漏会话。正常路径在 checkpoint 后立即拆除 Context，
+# 不会靠这段时间把空闲会话留给下一条任务。
 SESSION_TIMEOUT_SECONDS = int(os.getenv("SESSION_TIMEOUT_MS", "300000")) / 1_000
 TAB_INACTIVITY_SECONDS = int(os.getenv("TAB_INACTIVITY_MS", "300000")) / 1_000
 ALLOWED_HOST_SUFFIXES = (
@@ -523,10 +529,11 @@ class BrowserService:
         return PROTOCOL_VERSION
 
     async def _idle_reaper(self) -> None:
-        """按旧 sidecar 的会话和 Tab 闲置策略回收浏览器内存。
+        """回收泄漏的账号 Context 和长时间无人操作的 Tab。
 
-        仅回收没有正在执行操作的 Tab；Context 先从公开索引摘除，再等待
-        Tab 锁完成，避免清理线程把已失效的页面交给并发的 RPA 或人工输入。
+        正常路径由 GEO 在 checkpoint 后立即拆除 Context。这里不能在最后一个
+        Tab 关闭时拆 Context：保活没有 Tab，任务 Tab 关掉后 GEO 还要导出快照。
+        SESSION_TIMEOUT 只回收 GEO 崩溃后没关掉的会话。
         """
         while True:
             await asyncio.sleep(min(max(min(SESSION_TIMEOUT_SECONDS, TAB_INACTIVITY_SECONDS) / 4, 5), 30))
@@ -541,12 +548,6 @@ class BrowserService:
                     if tab.lock.locked() or now - tab.last_access < TAB_INACTIVITY_SECONDS:
                         continue
                     await self.close_tab(tab)
-
-                # 不能因为本轮保活或任务刚好关闭了最后一个 Tab，就立即关闭账号
-                # Context。后端可能正在为同一账号排队下一项保活/任务；立刻摘除
-                # session 会让已通过 session_for() 的并发请求在创建 Tab 时收到
-                # ``Session is closing``。空 Context 仍会在 SESSION_TIMEOUT_SECONDS
-                # 到期后统一回收，既保留账号隔离，也避免这一短暂竞争窗口。
 
     async def _browser_watchdog(self) -> None:
         """检测 Camoufox 子进程被 OOM 等原因杀死后，自动重建浏览器。
@@ -644,6 +645,11 @@ class BrowserService:
                 session.context.storage_state(indexed_db=False),
                 timeout=STORAGE_STATE_TIMEOUT_SECONDS,
             )
+            updates = getattr(session.context, ORIGIN_LOCAL_STORAGE_UPDATES_ATTR, None)
+            if isinstance(state, dict) and isinstance(updates, dict) and updates:
+                # Kimi 等平台在探活时旋转了 Token。Firefox 未打开过该 origin 时，
+                # storage_state() 可能仍是 hydrate 时的旧值，必须把内存中的新票合并进去。
+                state = merge_origin_local_storage(state, updates)
             if not isinstance(state, dict) or not isinstance(state.get("cookies"), list):
                 logger.warning(
                     "CAMOFOX_CHECKPOINT stage=invalid profile=%s elapsed_ms=%s",
@@ -673,10 +679,27 @@ class BrowserService:
             )
             return None
 
+    def _session_is_idle(self, session: SessionState) -> bool:
+        """没有 Tab、也没有进行中的 execution 时，视为可被新快照替换的空闲会话。"""
+        if session.tabs:
+            return False
+        return not any(
+            execution.profile_key == session.user_id
+            and execution.state in {"prepared", "submitting", "generating"}
+            for execution in self.executions.values()
+        )
+
     async def hydrate_account_session(
         self, profile_key: str, storage_state: object
     ) -> None:
-        """仅在账号尚无内存 Context 时应用 GEO 快照；已有会话忽略入站快照。"""
+        """空闲或尚无 Context 时用 GEO 快照重建；有 Tab 或执行中任务时复用现有会话。
+
+        空闲会话可能仍带着过期登录态。本机接入写回的新快照必须落到新 Context，
+        不能把“已经有内存会话”当成还是最新登录态。
+        """
+        existing = self.sessions.get(profile_key)
+        if existing is not None and self._session_is_idle(existing):
+            await self.close_session(profile_key)
         await self._session_for(
             profile_key,
             storage_state=self._normalized_storage_state(storage_state),
@@ -730,8 +753,8 @@ class BrowserService:
                     raise ProtocolError(503, "Camoufox Browser is not ready")
                 if len(self.sessions) >= MAX_SESSIONS:
                     raise ProtocolError(429, "Maximum sessions reached")
-                # Hydrate applies GEO snapshot only when creating a Context.
-                # Later tab/execution calls reuse the live session and ignore inbound state.
+                # 只有新建 Context 时才应用 GEO 快照。仍有 Tab 或执行中任务时
+                # hydrate 会复用现有会话；空闲会话已在 hydrate_account_session 中拆除。
                 context = await self._create_browser_context(
                     storage_state if apply_storage_state else None
                 )
@@ -1334,8 +1357,9 @@ class BrowserService:
         finally:
             if listener is not None:
                 await listener.close()
-            # 无论成功、取消还是失败都立即 checkpoint 并关闭任务 Tab。StorageState 留在
-            # sidecar 的受限卷内，执行结果和失败证据则由后端拉取后按其保留期持久化。
+            # 无论成功、取消还是失败都立即关闭任务 Tab。不能在这里拆除账号
+            # Context：GEO 还要 checkpoint 写回 storageState。空 Context 由 GEO
+            # 在 checkpoint 后立即拆除，不留给下一次任务复用。
             # sidecar 重启会丢失 execution registry；后端看到 execution_not_found 时必须
             # 把已提交任务收敛为不确定状态，绝不可重新提交。
             await self.close_tab(execution.tab)
@@ -1405,7 +1429,13 @@ class BrowserService:
         if session is None:
             return "uncertain"
         session.last_access = time.monotonic()
-        return await probe_browser_context(provider.value, session.context)
+        status = await probe_browser_context(provider.value, session.context)
+        logger.info(
+            "CAMOFOX_SESSION_PROBE provider=%s status=%s",
+            provider.value,
+            status,
+        )
+        return status
 
     async def create_manual_session(
         self, provider: ProviderName, profile_key: str

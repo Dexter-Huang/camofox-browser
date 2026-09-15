@@ -23,6 +23,7 @@ docker compose --env-file .env up -d --no-build camofox-browser
 - 对外只提供 `app/main.py` 中 GEO RPA protocol v4 所需的受限 HTTP 路由。
 - 不提供任意 JavaScript 执行、任意 URL/cookie/header、通用调试协议或 MCP 入口。
 - 账号登录快照由 GEO `storageState` 持有；sidecar 仅在内存 Context 中使用 Cookie + LocalStorage，不得写入本地 profile volume，也不得导入完整 Firefox profile 或 Sandbox/Chromium cookie。
+- 保活探活在 `app/session_probe.py`。不打开聊天页。Playwright `fetch` 没有 `json=`，POST body 必须放 `data`。Kimi 探活会旋转 `refresh_token`，checkpoint 必须合并新票。不得把 Cookie、Token 或响应正文写入日志。
 - 默认 `ENABLE_XVFB=true` 为 headed Firefox 提供私有显示；不要安装或映射 x11vnc/noVNC。
 - 关闭会话必须等待 teardown barrier，超时必须清理 Context 索引并重启受控浏览器。
 

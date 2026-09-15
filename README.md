@@ -19,9 +19,16 @@ awaitable closing barrier for that user. New sessions wait for the barrier. A
 Context close timeout restarts the controlled browser and removes all stale
 Context indexes, preventing late pages from becoming ghost tabs or reusing a stale Context after restart.
 
-GEO hydrates the account session from MySQL, then checkpoints Cookie + LocalStorage
-through `POST /rpa/accounts/session/checkpoint` before closing a manual window.
-A failed checkpoint must not be reported as a successful login.
+GEO hydrates the account session from MySQL, checkpoints Cookie + LocalStorage
+through `POST /rpa/accounts/session/checkpoint`, then deletes the in-memory
+session. Idle contexts are not reused across tasks. A failed manual-window
+checkpoint must not be reported as a successful login.
+
+Keepalive does not open the chat page. `app/session_probe.py` calls the platform
+user API on the hydrated Context and classifies business codes, never HTTP 200
+alone. Playwright `fetch` has no `json=`; POST bodies go in `data`. Kimi
+rotates `refresh_token` during probe, so checkpoint must merge the new tickets.
+Do not log cookies, tokens, or response bodies.
 
 Default Compose starts headed Firefox on a private Xvfb display and publishes
 only `127.0.0.1:9377`. Window-level VNC is deprecated: do not map RFB/noVNC

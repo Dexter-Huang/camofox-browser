@@ -9,8 +9,11 @@ import asyncio
 from app.main import BrowserService, SessionState
 from app.provider_automation import ProviderName
 from app.session_probe import (
+    ORIGIN_LOCAL_STORAGE_UPDATES_ATTR,
     SESSION_PROBE_SPECS,
     _build_headers,
+    _origin_local_storage_value,
+    merge_origin_local_storage,
     classify_deepseek,
     classify_doubao,
     classify_kimi,
@@ -46,6 +49,12 @@ def test_qianwen_headers_copy_xsrf_cookie() -> None:
 def test_classify_deepseek_missing_token() -> None:
     assert (
         classify_deepseek(200, '{"code":40002,"msg":"Missing Token","data":null}')
+        == "login_required"
+    )
+    assert (
+        classify_deepseek(
+            200, '{"code":40003,"msg":"Authorization Failed (invalid token)","data":null}'
+        )
         == "login_required"
     )
     assert classify_deepseek(200, '{"code":0,"data":{"id":"u1"}}') == "ok"
@@ -219,3 +228,284 @@ def test_keepalive_without_session_is_uncertain() -> None:
         service.create_tab.assert_not_called()
 
     asyncio.run(run())
+
+def test_probe_deepseek_sends_unwrapped_user_token_and_cookies() -> None:
+    """DeepSeek 探活必须带解开后的 userToken，并显式附上 Strict Cookie。"""
+
+    async def run() -> None:
+        context = AsyncMock()
+        context.cookies = AsyncMock(
+            return_value=[
+                {
+                    "name": "ds_session_id",
+                    "value": "alive",
+                    "domain": "chat.deepseek.com",
+                    "sameSite": "Strict",
+                },
+                {
+                    "name": "HWWAFSESID",
+                    "value": "waf",
+                    "domain": "chat.deepseek.com",
+                },
+            ]
+        )
+        context.storage_state = AsyncMock(
+            return_value={
+                "cookies": [],
+                "origins": [
+                    {
+                        "origin": "https://chat.deepseek.com",
+                        "localStorage": [
+                            {
+                                "name": "userToken",
+                                "value": '{"__version":0,"value":"real-token"}',
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        response = AsyncMock()
+        response.status = 200
+        response.text = AsyncMock(return_value='{"code":0,"data":{"biz_code":0,"biz_data":{},"biz_msg":""}}')
+        context.request.fetch = AsyncMock(return_value=response)
+        assert await probe_browser_context("deepseek", context) == "ok"
+        headers = context.request.fetch.await_args.kwargs["headers"]
+        assert headers["authorization"] == "Bearer real-token"
+        assert "ds_session_id=alive" in headers["cookie"]
+        assert "HWWAFSESID=waf" in headers["cookie"]
+
+    asyncio.run(run())
+
+
+def test_appkit_local_storage_unwraps_value() -> None:
+    """DeepSeek userToken 是 AppKit JSON，不能整段拿去当 Bearer。"""
+    state = {
+        "origins": [
+            {
+                "origin": "https://chat.deepseek.com",
+                "localStorage": [
+                    {
+                        "name": "userToken",
+                        "value": '{"__version":0,"value":"real-token"}',
+                    }
+                ],
+            }
+        ]
+    }
+    assert (
+        _origin_local_storage_value(state, "https://chat.deepseek.com", "userToken")
+        == "real-token"
+    )
+    assert _origin_local_storage_value(
+        {
+            "origins": [
+                {
+                    "origin": "https://chat.deepseek.com",
+                    "localStorage": [
+                        {"name": "userToken", "value": '{"__version":0,"value":null}'}
+                    ],
+                }
+            ]
+        },
+        "https://chat.deepseek.com",
+        "userToken",
+    ) is None
+
+def test_probe_kimi_sends_access_token_bearer() -> None:
+    """Kimi GetCurrentUser 只认 Authorization；Cookie 不够会 401 unauthenticated。"""
+
+    async def run() -> None:
+        context = AsyncMock()
+        context.cookies = AsyncMock(
+            return_value=[
+                {"name": "theme", "value": "dark", "domain": "www.kimi.com"},
+            ]
+        )
+        context.storage_state = AsyncMock(
+            return_value={
+                "cookies": [],
+                "origins": [
+                    {
+                        "origin": "https://www.kimi.com",
+                        "localStorage": [
+                            {"name": "access_token", "value": "kimi-access"},
+                        ],
+                    }
+                ],
+            }
+        )
+        response = AsyncMock()
+        response.status = 200
+        response.text = AsyncMock(return_value='{"user":{"id":"u1"}}')
+        context.request.fetch = AsyncMock(return_value=response)
+        assert await probe_browser_context("kimi", context) == "ok"
+        kwargs = context.request.fetch.await_args.kwargs
+        assert "json" not in kwargs
+        assert kwargs["data"] == b"{}"
+        assert kwargs["method"] == "POST"
+        headers = kwargs["headers"]
+        assert headers["authorization"] == "Bearer kimi-access"
+        assert headers["x-msh-platform"] == "web"
+        assert headers["content-type"] == "application/json"
+
+    asyncio.run(run())
+
+
+def test_probe_kimi_empty_cookies_still_sends_bearer() -> None:
+    """Kimi 登录态在 access_token，Cookie 罐空时仍应打探活接口。"""
+
+    async def run() -> None:
+        context = AsyncMock()
+        context.cookies = AsyncMock(return_value=[])
+        context.storage_state = AsyncMock(
+            return_value={
+                "cookies": [],
+                "origins": [
+                    {
+                        "origin": "https://www.kimi.com",
+                        "localStorage": [
+                            {"name": "access_token", "value": "kimi-access"},
+                        ],
+                    }
+                ],
+            }
+        )
+        response = AsyncMock()
+        response.status = 200
+        response.text = AsyncMock(return_value='{"user":{"id":"u1"}}')
+        context.request.fetch = AsyncMock(return_value=response)
+        assert await probe_browser_context("kimi", context) == "ok"
+        headers = context.request.fetch.await_args.kwargs["headers"]
+        assert headers["authorization"] == "Bearer kimi-access"
+
+    asyncio.run(run())
+
+def test_probe_kimi_refreshes_rotated_tokens_then_probes_user() -> None:
+    """Kimi access_token 15 分钟过期，探活必须先刷新并记下旋转后的 refresh。"""
+
+    async def run() -> None:
+        context = AsyncMock()
+        context.cookies = AsyncMock(
+            return_value=[{"name": "theme", "value": "dark", "domain": "www.kimi.com"}]
+        )
+        context.storage_state = AsyncMock(
+            return_value={
+                "cookies": [],
+                "origins": [
+                    {
+                        "origin": "https://www.kimi.com",
+                        "localStorage": [
+                            {"name": "access_token", "value": "expired-access"},
+                            {"name": "refresh_token", "value": "kimi-refresh"},
+                        ],
+                    }
+                ],
+            }
+        )
+        refresh_response = AsyncMock()
+        refresh_response.status = 200
+        refresh_response.text = AsyncMock(
+            return_value='{"accessToken":"new-access","refreshToken":"new-refresh"}'
+        )
+        user_response = AsyncMock()
+        user_response.status = 200
+        user_response.text = AsyncMock(return_value='{"user":{"id":"u1"}}')
+        context.request.fetch = AsyncMock(side_effect=[refresh_response, user_response])
+        assert await probe_browser_context("kimi", context) == "ok"
+        refresh_call, user_call = context.request.fetch.await_args_list
+        assert refresh_call.args[0].endswith("AuthService/RefreshToken")
+        assert refresh_call.kwargs["data"] == b'{"refreshToken":"kimi-refresh"}'
+        assert "authorization" not in {key.casefold() for key in refresh_call.kwargs["headers"]}
+        assert user_call.kwargs["headers"]["authorization"] == "Bearer new-access"
+        assert user_call.kwargs["data"] == b"{}"
+        updates = getattr(context, ORIGIN_LOCAL_STORAGE_UPDATES_ATTR)
+        assert updates["https://www.kimi.com"]["access_token"] == "new-access"
+        assert updates["https://www.kimi.com"]["refresh_token"] == "new-refresh"
+
+    asyncio.run(run())
+
+
+def test_probe_kimi_refresh_rejected_is_login_required() -> None:
+    async def run() -> None:
+        context = AsyncMock()
+        context.cookies = AsyncMock(
+            return_value=[{"name": "theme", "value": "dark", "domain": "www.kimi.com"}]
+        )
+        context.storage_state = AsyncMock(
+            return_value={
+                "cookies": [],
+                "origins": [
+                    {
+                        "origin": "https://www.kimi.com",
+                        "localStorage": [
+                            {"name": "refresh_token", "value": "dead-refresh"},
+                        ],
+                    }
+                ],
+            }
+        )
+        refresh_response = AsyncMock()
+        refresh_response.status = 401
+        refresh_response.text = AsyncMock(return_value='{"code":"unauthenticated"}')
+        context.request.fetch = AsyncMock(return_value=refresh_response)
+        assert await probe_browser_context("kimi", context) == "login_required"
+        assert context.request.fetch.await_count == 1
+
+    asyncio.run(run())
+
+
+def test_merge_origin_local_storage_updates_existing_keys() -> None:
+    state = {
+        "cookies": [],
+        "origins": [
+            {
+                "origin": "https://www.kimi.com",
+                "localStorage": [
+                    {"name": "access_token", "value": "old"},
+                    {"name": "theme", "value": "dark"},
+                ],
+            }
+        ],
+    }
+    merged = merge_origin_local_storage(
+        state, {"https://www.kimi.com": {"access_token": "new", "refresh_token": "r"}}
+    )
+    values = {
+        item["name"]: item["value"]
+        for item in merged["origins"][0]["localStorage"]
+    }
+    assert values["access_token"] == "new"
+    assert values["refresh_token"] == "r"
+    assert values["theme"] == "dark"
+
+def test_probe_qianwen_posts_client_channel_as_data() -> None:
+    """千问探活必须走 data= JSON，不能传 Playwright 不认的 json=。"""
+
+    async def run() -> None:
+        context = AsyncMock()
+        context.cookies = AsyncMock(
+            return_value=[
+                {"name": "tongyi_sso_ticket", "value": "sso", "domain": ".qianwen.com"},
+                {"name": "XSRF-TOKEN", "value": "tok", "domain": "api.qianwen.com"},
+            ]
+        )
+        context.storage_state = AsyncMock(return_value={"cookies": [], "origins": []})
+        response = AsyncMock()
+        response.status = 200
+        response.text = AsyncMock(
+            return_value='{"success":true,"failed":false,"data":{"userId":"u1"}}'
+        )
+        context.request.fetch = AsyncMock(return_value=response)
+        assert await probe_browser_context("qianwen", context) == "ok"
+        kwargs = context.request.fetch.await_args.kwargs
+        assert "json" not in kwargs
+        assert kwargs["method"] == "POST"
+        assert kwargs["data"] == b'{"clientChannel":"PC"}'
+        headers = kwargs["headers"]
+        assert headers["x-platform"] == "pc_tongyi"
+        assert headers["x-xsrf-token"] == "tok"
+        assert headers["content-type"] == "application/json"
+
+    asyncio.run(run())
+

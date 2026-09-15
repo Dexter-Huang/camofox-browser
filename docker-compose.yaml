@@ -32,6 +32,8 @@ services:
       MAX_TABS_GLOBAL: ${RPA_BROWSER_CAPACITY:-30}
       MAX_MANUAL_WINDOWS: ${RPA_MANUAL_SESSION_MAX_CONCURRENT:-0}
       MANUAL_WINDOW_CREATE_CONCURRENCY: ${RPA_MANUAL_WINDOW_CREATE_CONCURRENCY:-2}
+      # 空闲账号 Context 的泄漏回收上限。正常路径由 GEO 在 checkpoint 后立即拆除，
+      # 不再靠这段时间复用空会话。
       SESSION_TIMEOUT_MS: "300000"
       TAB_INACTIVITY_MS: "300000"
       TZ: ${CAMOFOX_TIMEZONE:-Asia/Shanghai}

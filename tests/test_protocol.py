@@ -1491,8 +1491,8 @@ def test_x11_parser_returns_only_direct_root_children() -> None:
     assert top_level_window_ids(tree) == ["0x200007", "0x200010"]
 
 
-def test_hydrate_creates_context_from_storage_state() -> None:
-    """GEO snapshot is applied only when the account Context does not exist yet."""
+def test_hydrate_replaces_idle_context_with_new_snapshot() -> None:
+    """空闲账号会话必须用新快照重建，不能继续复用过期 Context。"""
 
     async def run() -> None:
         service = BrowserService()
@@ -1508,6 +1508,32 @@ def test_hydrate_creates_context_from_storage_state() -> None:
         service.browser_ready = True
         state = {"cookies": [{"name": "sid", "value": "1", "domain": "example.com", "path": "/"}]}
         await service.hydrate_account_session("profile-key", state)
+        await service.hydrate_account_session("profile-key", {"cookies": []})
+        assert len(created) == 2
+        assert created[0]["storage_state"]["cookies"][0]["name"] == "sid"
+        assert created[1]["storage_state"]["cookies"] == []
+
+    asyncio.run(run())
+
+
+def test_hydrate_reuses_live_context_when_tab_exists() -> None:
+    """仍有 Tab 的会话不能被入站快照拆掉，以免打断执行中的任务。"""
+
+    async def run() -> None:
+        service = BrowserService()
+        browser = AsyncMock()
+        created = []
+
+        async def new_context(**kwargs):
+            created.append(kwargs)
+            return AsyncMock()
+
+        browser.new_context.side_effect = new_context
+        service.browser = browser
+        service.browser_ready = True
+        state = {"cookies": [{"name": "sid", "value": "1", "domain": "example.com", "path": "/"}]}
+        await service.hydrate_account_session("profile-key", state)
+        service.sessions["profile-key"].tabs["tab-1"] = object()
         await service.hydrate_account_session("profile-key", {"cookies": []})
         assert len(created) == 1
         assert created[0]["storage_state"]["cookies"][0]["name"] == "sid"
