@@ -347,7 +347,8 @@ class ExecutionCreateRequest(V4Request):
     provider: ProviderName
     profile_key: str = Field(min_length=1, max_length=256)
     query: str = Field(min_length=1, max_length=20_000)
-    debug: bool = False
+    # 业务截图是受限任务意图，不允许调用方传入页面规则、脚本或定位器。
+    capture_final_screenshot: bool = False
 
 
 class AccountRequest(V4Request):
@@ -408,6 +409,7 @@ class ExecutionPayload(TypedDict, total=False):
     result: ExecutionResult
     error: ExecutionError
     failureScreenshotBase64: str
+    finalScreenshotBase64: str
 
 
 @dataclass
@@ -419,11 +421,13 @@ class Execution:
     profile_key: str
     query: str
     tab: TabState
+    capture_final_screenshot: bool = False
     state: ExecutionState = "prepared"
     result: ExecutionResult | None = None
     error_code: str | None = None
     error_message: str | None = None
     failure_screenshot: bytes | None = None
+    final_screenshot: bytes | None = None
     task: asyncio.Task[None] | None = None
 
 
@@ -1216,7 +1220,12 @@ class BrowserService:
                 )
 
     async def create_execution(
-        self, execution_id: str, provider: ProviderName, profile_key: str, query: str
+        self,
+        execution_id: str,
+        provider: ProviderName,
+        profile_key: str,
+        query: str,
+        capture_final_screenshot: bool = False,
     ) -> Execution:
         """创建并填写任务页；未调用 submit 前不会向第三方平台派发问题。"""
         if not execution_id or len(execution_id) > 256 or not profile_key or len(profile_key) > 256:
@@ -1230,11 +1239,23 @@ class BrowserService:
         async with self._execution_lock:
             existing = self.executions.get(execution_id)
             if existing is not None:
-                if existing.provider != provider or existing.profile_key != profile_key or existing.query != query:
+                if (
+                    existing.provider != provider
+                    or existing.profile_key != profile_key
+                    or existing.query != query
+                    or existing.capture_final_screenshot != capture_final_screenshot
+                ):
                     raise ProtocolError(409, "executionId is already bound to another request")
                 return existing
             tab = await self.create_tab(profile_key, rule.entry_url)
-            execution = Execution(execution_id, provider, profile_key, query, tab)
+            execution = Execution(
+                execution_id,
+                provider,
+                profile_key,
+                query,
+                tab,
+                capture_final_screenshot=capture_final_screenshot,
+            )
             self.executions[execution_id] = execution
         try:
             # prepare 仅写入输入框，不触发提交。后端须在下一阶段将 promptSubmitted
@@ -1342,6 +1363,10 @@ class BrowserService:
                 if confirmed is not None:
                     result["conversationUrl"] = confirmed
                 execution.result = {"answerMarkdown": answer_markdown, "result": result}
+                if execution.capture_final_screenshot:
+                    execution.final_screenshot = await self._capture_final_screenshot(
+                        execution.tab.page, rule
+                    )
                 execution.state = "completed"
         except asyncio.CancelledError:
             execution.state = "cancelled"
@@ -1349,11 +1374,17 @@ class BrowserService:
         except ProviderAutomationError as exc:
             execution.state, execution.error_code, execution.error_message = "failed", exc.code, str(exc)
             with suppress(Exception):
-                execution.failure_screenshot = await execution.tab.page.screenshot(type="png")
+                screenshot = await execution.tab.page.screenshot(type="png")
+                execution.failure_screenshot = screenshot
+                if execution.capture_final_screenshot:
+                    execution.final_screenshot = screenshot
         except Exception:
             execution.state, execution.error_code, execution.error_message = "failed", "page_unavailable", "Provider execution failed"
             with suppress(Exception):
-                execution.failure_screenshot = await execution.tab.page.screenshot(type="png")
+                screenshot = await execution.tab.page.screenshot(type="png")
+                execution.failure_screenshot = screenshot
+                if execution.capture_final_screenshot:
+                    execution.final_screenshot = screenshot
         finally:
             if listener is not None:
                 await listener.close()
@@ -1363,6 +1394,28 @@ class BrowserService:
             # sidecar 重启会丢失 execution registry；后端看到 execution_not_found 时必须
             # 把已提交任务收敛为不确定状态，绝不可重新提交。
             await self.close_tab(execution.tab)
+
+    async def _capture_final_screenshot(
+        self, page: Page, rule: ProviderRule
+    ) -> bytes:
+        """截取受审查规则命中的最后回答；定位短暂失效时退回当前可见页面。
+
+        业务截图只读取当前任务 Tab 的像素，不能接受 GEO 下发的定位器或执行脚本。
+        截图问题不影响已获得的回答，因此任何定位异常都以页面截图降级。
+        """
+        try:
+            for selector in rule.answer_selectors:
+                locator = page.locator(selector)
+                count = await locator.count()
+                if count:
+                    return await locator.nth(count - 1).screenshot(type="png")
+        except Exception:
+            logger.info(
+                "Final answer screenshot locator failed; using page screenshot provider=%s",
+                rule.provider.value,
+                exc_info=True,
+            )
+        return await page.screenshot(type="png")
 
     async def capture_execution_preview(self, execution_id: str) -> bytes:
         """返回执行中的完整 PNG，不允许按账号、Tab 或页面规则读取。
@@ -1398,6 +1451,8 @@ class BrowserService:
             payload["error"] = {"code": execution.error_code, "message": execution.error_message or "Provider execution failed"}
         if execution.failure_screenshot is not None:
             payload["failureScreenshotBase64"] = base64.b64encode(execution.failure_screenshot).decode("ascii")
+        if execution.final_screenshot is not None:
+            payload["finalScreenshotBase64"] = base64.b64encode(execution.final_screenshot).decode("ascii")
         return payload
 
     async def cancel_execution(self, execution_id: str) -> Execution:
@@ -1736,6 +1791,7 @@ async def create_execution(request: Request) -> ExecutionPayload:
             body.provider,
             body.profile_key,
             body.query,
+            body.capture_final_screenshot,
         )
         return service.execution_payload(execution)
     except ProtocolError as exc:

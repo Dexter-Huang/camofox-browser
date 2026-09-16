@@ -8,6 +8,18 @@ Only the controlled HTTP routes used by `backend/app/rpa/camofox_browser.py`
 are available. The service does not expose arbitrary JavaScript execution,
 cookie export, arbitrary request headers, or a general browser debugging API.
 
+### Final-answer screenshot intent
+
+`POST /rpa/executions` accepts the fixed task identity, provider, profile key,
+query, and the optional `captureFinalScreenshot` boolean. The boolean is a
+business intent only: it never accepts a URL, selector, browser script, cookie,
+or request header. When enabled, the sidecar captures one PNG before closing
+the task tab: on success it uses the last answer node from the reviewed
+provider rule and falls back to the visible page; on failure it captures the
+visible page. The PNG is returned only in the terminal execution payload for
+GEO to store in its private OSS prefix. It is not the executing-task preview
+or the super-admin debug-frame stream.
+
 ## Protocol and isolation
 
 `/health` always declares `geoRpaProtocolVersion=4`. Per-account login snapshot

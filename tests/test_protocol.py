@@ -1243,6 +1243,72 @@ def test_v4_execution_request_rejects_browser_control_fields() -> None:
         )
 
 
+def test_v4_execution_request_allows_only_final_screenshot_intent() -> None:
+    """最终截图是唯一新增业务意图，仍不允许调用方控制浏览器细节。"""
+    request = ExecutionCreateRequest.model_validate(
+        {
+            "executionId": "task-1",
+            "provider": ProviderName.DEEPSEEK,
+            "profileKey": "geo-rpa-deepseek-account-1",
+            "query": "question",
+            "captureFinalScreenshot": True,
+        }
+    )
+
+    assert request.capture_final_screenshot is True
+
+
+def test_final_screenshot_uses_last_answer_locator_then_viewport_fallback() -> None:
+    """六个平台均复用镜像内回答规则，定位失败时只截当前可见页面。"""
+
+    class AnswerLocator:
+        async def count(self) -> int:
+            return 2
+
+        def nth(self, index: int) -> "AnswerLocator":
+            assert index == 1
+            return self
+
+        async def screenshot(self, *, type: str) -> bytes:
+            assert type == "png"
+            return b"answer-png"
+
+    class AnswerPage:
+        def locator(self, _selector: str) -> AnswerLocator:
+            return AnswerLocator()
+
+        async def screenshot(self, *, type: str) -> bytes:
+            raise AssertionError("answer locator should be preferred")
+
+    class FallbackLocator:
+        async def count(self) -> int:
+            return 0
+
+    class FallbackPage:
+        def locator(self, _selector: str) -> FallbackLocator:
+            return FallbackLocator()
+
+        async def screenshot(self, *, type: str) -> bytes:
+            assert type == "png"
+            return b"viewport-png"
+
+    async def verify() -> None:
+        browser_service = BrowserService()
+        for rule in RULES.values():
+            assert (
+                await browser_service._capture_final_screenshot(AnswerPage(), rule)
+                == b"answer-png"
+            )
+        assert (
+            await browser_service._capture_final_screenshot(
+                FallbackPage(), rule_for("deepseek")
+            )
+            == b"viewport-png"
+        )
+
+    asyncio.run(verify())
+
+
 def test_v4_openapi_declares_the_six_provider_values() -> None:
     schema = app.openapi()
     request_schema = schema["paths"]["/rpa/executions"]["post"]["requestBody"][
@@ -1851,6 +1917,7 @@ def test_execution_create_schema_excludes_storage_state() -> None:
     schema = ExecutionCreateRequest.model_json_schema(by_alias=True)
     assert "storageState" not in schema.get("properties", {})
     assert "profileKey" in schema.get("properties", {})
+    assert "captureFinalScreenshot" in schema.get("properties", {})
 
 
 def test_vnc_environment_parser_is_explicit_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
