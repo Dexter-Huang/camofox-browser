@@ -42,6 +42,7 @@ from app.provider_automation import (
     NetworkAnswerListener,
     _network_answer_from_payload,
     _network_citations_from_payload,
+    _select_post_submit_mode,
     ProviderAutomationError,
     ProviderName,
     RULES,
@@ -547,6 +548,76 @@ def test_answer_wait_policy_rejects_platform_placeholder_text() -> None:
 
     assert not policy.accepts("正在思考\nQuick Answer")
     assert policy.accepts("这是已经稳定展示的正式回答内容。")
+
+
+class _PostSubmitLocator:
+    """记录模式选项的出现次数和点击，供元宝提交后选择测试使用。"""
+
+    def __init__(self, *, count: int, visible: bool = True, enabled: bool = True) -> None:
+        self._count = count
+        self.visible = visible
+        self.enabled = enabled
+        self.clicks = 0
+
+    async def count(self) -> int:
+        return self._count
+
+    def nth(self, _index: int) -> "_PostSubmitLocator":
+        return self
+
+    async def is_visible(self, timeout: int = 500) -> bool:
+        return self.visible
+
+    async def is_enabled(self, timeout: int = 500) -> bool:
+        return self.enabled
+
+    async def bounding_box(self) -> None:
+        return None
+
+    async def click(self, timeout: int = 5_000, no_wait_after: bool = True) -> None:
+        self.clicks += 1
+
+
+class _PostSubmitPage:
+    def __init__(self, locators: dict[str, _PostSubmitLocator]) -> None:
+        self.locators = locators
+        self.mouse = None
+
+    def locator(self, selector: str) -> _PostSubmitLocator:
+        return self.locators.get(selector, _PostSubmitLocator(count=0))
+
+
+def test_yuanbao_missing_post_submit_mode_continues_to_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """英文 Instant 界面提交后不再出现 Quick Answer，不能因此判 answer_timeout。"""
+
+    import app.provider_automation as automation
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(automation.time, "monotonic", lambda: clock["now"])
+
+    async def fake_sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    monkeypatch.setattr(automation.asyncio, "sleep", fake_sleep)
+    page = _PostSubmitPage({})
+    asyncio.run(_select_post_submit_mode(page, rule_for("yuanbao"), {}))
+    assert clock["now"] >= 20.0
+
+
+def test_yuanbao_post_submit_still_clicks_new_quick_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧界面本轮新出现的快速回答仍须点选，不能改成直接跳过。"""
+
+    import app.provider_automation as automation
+
+    option = _PostSubmitLocator(count=1)
+    page = _PostSubmitPage({":text-is('Quick Answer')": option})
+    monkeypatch.setattr(automation.time, "monotonic", lambda: 0.0)
+    asyncio.run(_select_post_submit_mode(page, rule_for("yuanbao"), {":text-is('Quick Answer')": 0}))
+    assert option.clicks == 1
 
 
 def test_v4_conversation_url_is_sanitized_by_sidecar_rule() -> None:

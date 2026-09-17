@@ -466,8 +466,9 @@ RULES: dict[ProviderName, ProviderRule] = {
             rejected_text_fragments=("正在思考", "Quick Answer"),
         ),
         network_answer=YUANBAO_NETWORK_ANSWER,
-        # 页面当前可能显示英文 Quick Answer 或中文“快速回答”；两者都只匹配精确
-        # 可点击控件，且只取本轮提交后新增的最后一个选项。
+        # 旧界面提交后才出现 Quick Answer / 快速回答；英文 Instant 界面会在发送前
+        # 就把模式选好，提交后不再出现新选项。选择器仍只匹配本轮新增的精确控件，
+        # 找不到时不能失败，否则 Instant 已经生成的回答会被丢掉。
         post_submit_selectors=(
             "button:has-text('Quick Answer')",
             "[role='button']:has-text('Quick Answer')",
@@ -1652,7 +1653,11 @@ async def _post_submit_option_counts(page: Page, selectors: tuple[str, ...]) -> 
 
 
 async def _select_post_submit_mode(page: Page, rule: ProviderRule, baseline: dict[str, int]) -> None:
-    """点击本轮新出现的静态模式选项，元宝默认选择快速回答。"""
+    """点击本轮新出现的静态模式选项，元宝优先选择快速回答。
+
+    海外英文 Instant 界面会在提交前选好模式，发送后不再出现 Quick Answer。
+    监听器此时已经在采集回答，找不到选项必须继续，不能把已生成的正文判失败。
+    """
 
     if not rule.post_submit_selectors:
         return
@@ -1673,7 +1678,6 @@ async def _select_post_submit_mode(page: Page, rule: ProviderRule, baseline: dic
             except Exception:
                 continue
         await asyncio.sleep(0.25)
-    raise ProviderAutomationError("answer_timeout", "Provider answer mode was not available")
 
 
 async def prepare(page: Page, rule: ProviderRule, query: str) -> None:
