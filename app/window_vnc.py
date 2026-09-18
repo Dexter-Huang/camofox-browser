@@ -1,17 +1,15 @@
 """X11 单窗口发布器。
 
 此模块只接收服务内部生成的 X11 window id，并启动一个绑定该窗口的
-``x11vnc`` 与 WebSocket-to-RFB bridge。HTTP 路由只能持有不透明 handle，
-不得向调用方返回 window id、RFB 端口或子进程信息。
+``x11vnc``。HTTP 路由只能持有不透明 handle，不得向调用方返回 window id、
+RFB 端口或子进程信息。noVNC WebSocket bridge 已移除。
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import socket
-import sys
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -103,7 +101,7 @@ def assert_tcp_port_available(port: int) -> None:
 
 
 async def wait_for_tcp_port(port: int) -> None:
-    """等待 bridge 开始监听，避免把尚未启动的地址交给后端代理。"""
+    """等待 RFB 端口开始监听，避免把尚未启动的地址交给后端代理。"""
     for attempt in range(PUBLISHER_READINESS_ATTEMPTS):
         try:
             _, writer = await asyncio.wait_for(
@@ -158,7 +156,7 @@ async def stop_process(process: asyncio.subprocess.Process | None) -> None:
 
 @dataclass
 class WindowPublisher:
-    """一个 X11 窗口对应的一对私有 RFB/WebSocket 进程。
+    """一个 X11 窗口对应的私有 RFB 进程。
 
     ``capture_wait_ms`` 与 ``capture_defer_ms`` 只控制 x11vnc 读取这个窗口的节奏。
     人工窗口可用较低帧率降低对共享 Firefox/Xvfb 的持续编码压力；任务观察窗口保持
@@ -168,29 +166,23 @@ class WindowPublisher:
     display: str
     window_id: str
     rfb_port: int
-    websocket_port: int | None = None
     expose_rfb_to_docker_network: bool = False
     capture_wait_ms: int = 10
     capture_defer_ms: int = 10
     _x11vnc: asyncio.subprocess.Process | None = None
-    _bridge: asyncio.subprocess.Process | None = None
 
     @property
     def running(self) -> bool:
-        if self._x11vnc is None or self._x11vnc.returncode is not None:
-            return False
-        return self.websocket_port is None or (
-            self._bridge is not None and self._bridge.returncode is None
-        )
+        return self._x11vnc is not None and self._x11vnc.returncode is None
 
     def x11vnc_command(self) -> list[str]:
         """生成单窗口发布命令，并固定动态网页所需的保守 RFB 参数。
 
         x11vnc 默认会通过窗口移动和页面滚动启发式发送 ``CopyRect``。浏览器页面
         长时间运行时仍可能有异步布局、光标或滚动更新；旧版 LibVNCServer 在这类
-        增量流中一旦失步，noVNC 会把像素字节误读成下一个矩形的 encoding 并断开。
+        增量流中一旦失步，RFB 客户端会把像素字节误读成下一个矩形的 encoding 并断开。
         人工会话更重视连续可操作性，因此关闭两种启发式 CopyRect，只保留普通
-        framebuffer 更新。同时取消默认客户端读超时；连接保活由 WebSocket 层负责，
+        framebuffer 更新。同时取消默认客户端读超时；连接保活由应用代理负责，
         不让旧 LibVNCServer 主动插入 1x1 更新与正常矩形发送发生竞争。
         """
         command = [
@@ -230,14 +222,12 @@ class WindowPublisher:
         return command
 
     async def start(self) -> None:
-        """启动发布器并仅在 RFB 与 WebSocket 都就绪后返回。"""
+        """启动发布器并仅在 RFB 就绪后返回。"""
         if not valid_display(self.display) or not valid_window_id(self.window_id):
             raise RuntimeError("Window publisher target is invalid")
         if not 1 <= self.capture_wait_ms <= 1_000 or not 1 <= self.capture_defer_ms <= 1_000:
             raise RuntimeError("Window publisher capture cadence is invalid")
         assert_tcp_port_available(self.rfb_port)
-        if self.websocket_port is not None:
-            assert_tcp_port_available(self.websocket_port)
         self._x11vnc = await asyncio.create_subprocess_exec(
             *self.x11vnc_command(),
             stdout=asyncio.subprocess.DEVNULL,
@@ -246,29 +236,11 @@ class WindowPublisher:
         try:
             await wait_for_tcp_port(self.rfb_port)
             await wait_for_rfb_greeting(self.rfb_port)
-            if self.websocket_port is not None:
-                environment = os.environ | {"RFB_TARGET_PORT": str(self.rfb_port)}
-                self._bridge = await asyncio.create_subprocess_exec(
-                    sys.executable,
-                    "-m",
-                    "uvicorn",
-                    "app.novnc:app",
-                    "--host",
-                    "0.0.0.0",
-                    "--port",
-                    str(self.websocket_port),
-                    env=environment,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await wait_for_tcp_port(self.websocket_port)
         except Exception:
             await self.stop()
             raise
 
     async def stop(self) -> None:
         """幂等撤销发布器，不关闭仍可继续执行的浏览器窗口。"""
-        await stop_process(self._bridge)
         await stop_process(self._x11vnc)
-        self._bridge = None
         self._x11vnc = None

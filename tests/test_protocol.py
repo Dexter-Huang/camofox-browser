@@ -1404,23 +1404,18 @@ def test_window_publisher_is_an_optional_v4_capability(
     assert BrowserService().protocol_version == 4
 
 
-def test_manual_window_allocates_only_a_private_rfb_port(
+def test_window_publisher_allocates_only_a_private_rfb_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """人工认证由 GEO 直连 RFB，不得为每个窗口分配 bridge 端口。"""
+    """窗口发布器只分配 RFB 端口，不再启动 noVNC WebSocket bridge。"""
     monkeypatch.setenv("WINDOW_PUBLISHER_RFB_BASE_PORT", "5902")
-    monkeypatch.setenv("WINDOW_PUBLISHER_WS_BASE_PORT", "6082")
     instance = BrowserService()
 
-    manual_rfb_port, manual_websocket_port = instance._next_window_ports(
-        websocket_required=False
-    )
-    task_rfb_port, task_websocket_port = instance._next_window_ports(
-        websocket_required=True
-    )
+    first_rfb_port = instance._next_window_ports()
+    second_rfb_port = instance._next_window_ports()
 
-    assert (manual_rfb_port, manual_websocket_port) == (5902, None)
-    assert (task_rfb_port, task_websocket_port) == (5903, 6082)
+    assert first_rfb_port == 5902
+    assert second_rfb_port == 5903
 
 
 def test_manual_window_features_follow_valid_xvfb_resolution(

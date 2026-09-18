@@ -79,6 +79,7 @@ BROWSER_WATCHDOG_INTERVAL_SECONDS = max(
 )
 VNC_DEFAULT_RESOLUTION = "1920x1080x24"
 WINDOW_PUBLISHER_RFB_BASE_PORT = 5902
+# 6082 曾是 noVNC WebSocket 基址；现在只作为 RFB 分配的开区间上限保留。
 WINDOW_PUBLISHER_WS_BASE_PORT = 6082
 # ``goto(..., wait_until="commit")`` 只说明导航已被 Firefox 接收，尚不能保证 Xvfb
 # 已合成首帧。人工 VNC 直接附着该原生窗口，过早启动 x11vnc 会把短暂的未绘制区域
@@ -95,7 +96,7 @@ MANUAL_WINDOW_VNC_CAPTURE_DEFER_MS = 40
 MANUAL_WINDOW_CREATE_CONCURRENCY = max(
     1, min(8, int(os.getenv("MANUAL_WINDOW_CREATE_CONCURRENCY", "2")))
 )
-# 人工窗口包含独立 Firefox popup、x11vnc 与 WebSocket bridge；该限制必须和
+# 人工窗口包含独立 Firefox popup 与可选 x11vnc；该限制必须和
 # GEO API 的 RPA_MANUAL_SESSION_MAX_CONCURRENT 使用同一部署值。
 # 0 表示不设置人工窗口硬上限；正整数时必须与 GEO API 的部署配置一致。
 MAX_MANUAL_WINDOWS = int(os.getenv("MAX_MANUAL_WINDOWS", "0"))
@@ -298,7 +299,6 @@ class ManagedWindow:
     state: str = "window_ready"
     publisher: WindowPublisher | None = None
     rfb_port: int | None = None
-    websocket_port: int | None = None
 
 
 ExecutionState = Literal["prepared", "submitting", "generating", "completed", "failed", "cancelled"]
@@ -462,9 +462,6 @@ class BrowserService:
         )
         self._next_window_rfb_port = bounded_port(
             "WINDOW_PUBLISHER_RFB_BASE_PORT", WINDOW_PUBLISHER_RFB_BASE_PORT
-        )
-        self._next_window_ws_port = bounded_port(
-            "WINDOW_PUBLISHER_WS_BASE_PORT", WINDOW_PUBLISHER_WS_BASE_PORT
         )
         self.executions: dict[str, Execution] = {}
         self._execution_lock = asyncio.Lock()
@@ -1070,28 +1067,21 @@ class BrowserService:
             )
         return True
 
-    def _next_window_ports(
-        self, *, websocket_required: bool
-    ) -> tuple[int, int | None]:
-        """为单个账号窗口分配容器内唯一端口对。
+    def _next_window_ports(self) -> int:
+        """为单个账号窗口分配容器内唯一 RFB 端口。
 
-        人工认证与任务观察共用这一分配器，保证不同账号绝不会复用同一 RFB 或
-        WebSocket 上游；端口只返回给应用后端代理，绝不进入浏览器前端。
+        人工认证与任务观察共用这一分配器，保证不同账号绝不会复用同一 RFB；
+        端口只返回给应用后端代理，绝不进入浏览器前端。noVNC WebSocket
+        bridge 已移除，不再分配 608x 端口。
         """
         rfb_port = self._next_window_rfb_port
-        websocket_port = self._next_window_ws_port if websocket_required else None
-        if (
-            not 1024 <= rfb_port < WINDOW_PUBLISHER_WS_BASE_PORT
-            or (websocket_port is not None and websocket_port > 65535)
-        ):
+        if not 1024 <= rfb_port < WINDOW_PUBLISHER_WS_BASE_PORT:
             raise ProtocolError(503, "Window publisher port range is exhausted")
         self._next_window_rfb_port += 1
-        if websocket_port is not None:
-            self._next_window_ws_port += 1
-        return rfb_port, websocket_port
+        return rfb_port
 
     async def publish_window(self, handle: str, user_id: str) -> ManagedWindow:
-        """启动或复用指定窗口的私有 RFB/WebSocket 发布器。"""
+        """启动或复用指定窗口的私有 RFB 发布器。"""
         async with self._window_lock:
             window = self.windows.get(handle)
             if window is None or window.user_id != user_id or window.tab.page.is_closed():
@@ -1102,21 +1092,17 @@ class BrowserService:
                 await window.publisher.stop()
                 window.publisher = None
                 window.rfb_port = None
-                window.websocket_port = None
             if window.kind == "manual":
                 # VNC 发布器会立即读取该 X11 窗口；先完成轻量首帧门槛，避免客户
                 # 首次连入时把 Firefox/Xvfb 尚未合成的黑色 framebuffer 误认为掉线。
                 await wait_for_manual_window_paint(window.tab.page)
                 if window.tab.page.is_closed():
                     raise ProtocolError(404, "Window not found")
-            rfb_port, websocket_port = self._next_window_ports(
-                websocket_required=window.kind == "task"
-            )
+            rfb_port = self._next_window_ports()
             publisher = WindowPublisher(
                 display=self.x11_display,
                 window_id=window.window_id,
                 rfb_port=rfb_port,
-                websocket_port=websocket_port,
                 expose_rfb_to_docker_network=window.kind == "manual",
                 capture_wait_ms=(
                     MANUAL_WINDOW_VNC_CAPTURE_WAIT_MS
@@ -1141,7 +1127,6 @@ class BrowserService:
                 raise ProtocolError(409, "Window publisher could not start") from exc
             window.publisher = publisher
             window.rfb_port = rfb_port
-            window.websocket_port = websocket_port
             window.state = "published"
             return window
 
@@ -1154,7 +1139,6 @@ class BrowserService:
             publisher = window.publisher
             window.publisher = None
             window.rfb_port = None
-            window.websocket_port = None
             if window.state != "failed":
                 window.state = "window_ready"
         if publisher is not None:
@@ -1921,13 +1905,11 @@ async def delete_manual_session(handle: str, request: Request) -> BooleanPayload
 
 @app.get("/vnc/status")
 async def vnc_status() -> dict[str, Any]:
-    """仅返回 VNC 传输状态，不返回密码、会话或浏览器页面数据。"""
+    """仅返回遗留 VNC 开关状态；不再提供 noVNC 端口或静态入口。"""
     return {
         "enabled": service.vnc_enabled,
         "running": service.vnc_enabled and service.browser_ready,
         "vncPort": bounded_port("VNC_PORT", 5900),
-        "novncPort": bounded_port("NOVNC_PORT", 6080),
-        "path": "/vnc.html",
     }
 
 
@@ -2041,17 +2023,14 @@ async def create_task_window(tab_id: str, request: Request) -> dict[str, str]:
 
 @app.post("/rpa/task-windows/{handle}/observer")
 async def open_task_observer(handle: str, request: Request) -> dict[str, int | str]:
-    """按需发布任务窗口；端口仅返回给后端的容器内代理。"""
+    """任务观察不再发布 noVNC WebSocket；窗口级 VNC 已弃用。"""
     body = await request_object(request)
     try:
         user_id = require_string(body.get("userId"), "userId", 256)
         window = service.windows.get(handle)
         if window is None or window.user_id != user_id or window.kind != "task":
             raise ProtocolError(404, "Task window not found")
-        window = await service.publish_window(handle, user_id)
-        if window.websocket_port is None:
-            raise ProtocolError(409, "Task observer is unavailable")
-        return {"state": window.state, "websocketPort": window.websocket_port}
+        raise ProtocolError(409, "Task observer is unavailable")
     except ProtocolError as exc:
         raise error_response(exc) from exc
 
