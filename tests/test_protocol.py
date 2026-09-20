@@ -42,6 +42,7 @@ from app.provider_automation import (
     NetworkAnswerListener,
     _network_answer_from_payload,
     _network_citations_from_payload,
+    _network_reasoning_from_payload,
     _select_post_submit_mode,
     ProviderAutomationError,
     ProviderName,
@@ -437,6 +438,49 @@ def test_network_answer_uses_only_doubao_assistant_content_blocks() -> None:
     policy = rule_for("doubao").network_answer
     assert policy is not None
     assert _network_answer_from_payload(payload, policy) == "## Official answer\n\nThe first verified paragraph.\n\nThe second verified paragraph."
+
+
+def test_kimi_network_answer_separates_thinking_from_final_text() -> None:
+    """Kimi Connect 的思考和私有引用标记不得污染正文，并回传结构化来源。"""
+    def frame(payload: dict[str, object]) -> bytes:
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return bytes((0,)) + len(encoded).to_bytes(4, "big") + encoded
+
+    payload = b"".join(
+        (
+            frame({"message": {"role": "assistant"}}),
+            frame({"mask": "block.think.content", "block": {"think": {"content": "先分析用户需求。"}}}),
+            frame(
+                {
+                    "mask": "block.text",
+                    "block": {
+                        "text": {
+                            "content": "这是经过整理、可直接阅读的正式模型回答内容。\ue3a0cite🛠web_search:1#0:~:text=来源\ue3a8"
+                        }
+                    },
+                }
+            ),
+            frame(
+                {
+                    "message": {
+                        "refs": {
+                            "searchChunks": [
+                                {"url": "https://example.com/kimi-source", "title": "Kimi 结构化来源"}
+                            ]
+                        }
+                    }
+                }
+            ),
+        )
+    )
+    policy = rule_for("kimi").network_answer
+    assert policy is not None
+
+    assert _network_answer_from_payload(payload, policy) == "这是经过整理、可直接阅读的正式模型回答内容。"
+    assert _network_reasoning_from_payload(payload, policy) == "先分析用户需求。"
+    assert _network_citations_from_payload(payload, policy.parser) == [
+        {"url": "https://example.com/kimi-source", "title": "Kimi 结构化来源"}
+    ]
 
 
 def test_network_listener_arms_without_page_script_injection() -> None:
@@ -1329,35 +1373,12 @@ def test_v4_execution_request_allows_only_final_screenshot_intent() -> None:
     assert request.capture_final_screenshot is True
 
 
-def test_final_screenshot_uses_last_answer_locator_then_viewport_fallback() -> None:
-    """六个平台均复用镜像内回答规则，定位失败时只截当前可见页面。"""
+def test_final_screenshot_captures_current_viewport() -> None:
+    """六个平台最终截图都取当前可见全屏，不再按回答节点裁切。"""
 
-    class AnswerLocator:
-        async def count(self) -> int:
-            return 2
-
-        def nth(self, index: int) -> "AnswerLocator":
-            assert index == 1
-            return self
-
-        async def screenshot(self, *, type: str) -> bytes:
-            assert type == "png"
-            return b"answer-png"
-
-    class AnswerPage:
-        def locator(self, _selector: str) -> AnswerLocator:
-            return AnswerLocator()
-
-        async def screenshot(self, *, type: str) -> bytes:
-            raise AssertionError("answer locator should be preferred")
-
-    class FallbackLocator:
-        async def count(self) -> int:
-            return 0
-
-    class FallbackPage:
-        def locator(self, _selector: str) -> FallbackLocator:
-            return FallbackLocator()
+    class ViewportPage:
+        def locator(self, _selector: str) -> None:
+            raise AssertionError("final screenshot must not use answer locators")
 
         async def screenshot(self, *, type: str) -> bytes:
             assert type == "png"
@@ -1365,17 +1386,7 @@ def test_final_screenshot_uses_last_answer_locator_then_viewport_fallback() -> N
 
     async def verify() -> None:
         browser_service = BrowserService()
-        for rule in RULES.values():
-            assert (
-                await browser_service._capture_final_screenshot(AnswerPage(), rule)
-                == b"answer-png"
-            )
-        assert (
-            await browser_service._capture_final_screenshot(
-                FallbackPage(), rule_for("deepseek")
-            )
-            == b"viewport-png"
-        )
+        assert await browser_service._capture_final_screenshot(ViewportPage()) == b"viewport-png"
 
     asyncio.run(verify())
 

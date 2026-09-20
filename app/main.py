@@ -309,6 +309,7 @@ class AutomationResult(TypedDict, total=False):
 
     citations: list[Citation]
     conversationUrl: str
+    reasoningMarkdown: str
 
 
 class ExecutionResult(TypedDict):
@@ -1329,6 +1330,7 @@ class BrowserService:
                     )
                     answer_markdown = network_answer.markdown
                     citations = network_answer.citations
+                    reasoning_markdown = network_answer.reasoning
                 except ProviderAutomationError as network_error:
                     if network_error.code not in {"answer_timeout", "answer_incomplete"}:
                         raise
@@ -1342,14 +1344,18 @@ class BrowserService:
                         baseline_count=baseline_count,
                         submitted_query=execution.query,
                     )
+                    # DOM 兜底无法依据稳定协议区分 Kimi 思考区，宁可不返回也不猜测。
+                    reasoning_markdown = None
                 result: AutomationResult = {"citations": citations}
+                if reasoning_markdown:
+                    result["reasoningMarkdown"] = reasoning_markdown
                 confirmed = conversation_url(rule, execution.tab.page.url)
                 if confirmed is not None:
                     result["conversationUrl"] = confirmed
                 execution.result = {"answerMarkdown": answer_markdown, "result": result}
                 if execution.capture_final_screenshot:
                     execution.final_screenshot = await self._capture_final_screenshot(
-                        execution.tab.page, rule
+                        execution.tab.page
                     )
                 execution.state = "completed"
         except asyncio.CancelledError:
@@ -1379,26 +1385,13 @@ class BrowserService:
             # 把已提交任务收敛为不确定状态，绝不可重新提交。
             await self.close_tab(execution.tab)
 
-    async def _capture_final_screenshot(
-        self, page: Page, rule: ProviderRule
-    ) -> bytes:
-        """截取受审查规则命中的最后回答；定位短暂失效时退回当前可见页面。
+    async def _capture_final_screenshot(self, page: Page) -> bytes:
+        """截取当前任务 Tab 的可见全屏，不按回答节点裁切。
 
-        业务截图只读取当前任务 Tab 的像素，不能接受 GEO 下发的定位器或执行脚本。
-        截图问题不影响已获得的回答，因此任何定位异常都以页面截图降级。
+        六个平台的回答节点常被内部滚动截断，品牌监测最终截图改为当前视口 PNG。
+        暂不裁切左侧导航，也不使用 ``full_page``：后者只滚文档高度，仍然包不住
+        聊天区内部溢出。业务截图只读取当前 Tab 像素，不能接受 GEO 下发的定位器。
         """
-        try:
-            for selector in rule.answer_selectors:
-                locator = page.locator(selector)
-                count = await locator.count()
-                if count:
-                    return await locator.nth(count - 1).screenshot(type="png")
-        except Exception:
-            logger.info(
-                "Final answer screenshot locator failed; using page screenshot provider=%s",
-                rule.provider.value,
-                exc_info=True,
-            )
         return await page.screenshot(type="png")
 
     async def capture_execution_preview(self, execution_id: str) -> bytes:

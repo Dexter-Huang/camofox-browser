@@ -96,6 +96,7 @@ class NetworkAnswerParser(str, Enum):
     JSON_TEXT_FIELDS = "json_text_fields"
     DOUBAO_CONTENT_BLOCK_EVENT = "doubao_content_block_event"
     DEEPSEEK_CONTENT_EVENT = "deepseek_content_event"
+    KIMI_CONNECT_TEXT_EVENT = "kimi_connect_text_event"
     QIANWEN_IFRAME_EVENT = "qianwen_iframe_event"
     YUANBAO_TEXT_EVENT = "yuanbao_text_event"
     WENXIN_MARKDOWN_EVENT = "wenxin_markdown_event"
@@ -324,6 +325,7 @@ KIMI_NETWORK_ANSWER = NetworkAnswerPolicy(
         NetworkEndpoint("www.kimi.com", "/apiv2/kimi.gateway.chat.v1.ChatService/", NetworkPayloadFormat.CONNECT),
         NetworkEndpoint("www.kimi.com", "/api/chat/", NetworkPayloadFormat.SSE),
     ),
+    parser=NetworkAnswerParser.KIMI_CONNECT_TEXT_EVENT,
 )
 QIANWEN_NETWORK_ANSWER = NetworkAnswerPolicy(
     endpoints=(
@@ -748,6 +750,9 @@ _CITATION_PATTERN = re.compile(
     r'"url"\s*:\s*"((?:\\.|[^"\\])*)"[^{}]{0,1200}?"(?:title|name)"\s*:\s*"((?:\\.|[^"\\])*)"'
 )
 _SSE_DATA_PATTERN = re.compile(r"(?m)^data:\s*(.+)$")
+# Kimi 用私有 Unicode 边界包裹正文中的检索锚点。它不能直接跳转，且真实来源必须
+# 来自同一 Connect 帧的结构化 refs，不能将这个前端标记留在回答 Markdown 中。
+_KIMI_INLINE_CITATION_PATTERN = re.compile(r"\ue3a0cite[^\ue3a8]*\ue3a8")
 # 元宝正文里的内部下划线标注只服务于其网页渲染器，不能进入持久化 Markdown。
 _YUANBAO_ANNOTATION_MARK_PATTERN = re.compile(r"\[\]\(@mark_underline=\d+\)")
 _YUANBAO_BUBBLE_CITATION_PATTERN = re.compile(
@@ -782,6 +787,63 @@ def _merge_stream_fragments(fragments: list[str]) -> str:
         else:
             merged += text
     return merged.strip()
+
+
+def _kimi_connect_json_frames(payload: bytes) -> list[dict[str, object]]:
+    """解包 Kimi Connect 的完整 JSON 帧，丢弃未完成帧与 trailers。"""
+
+    frames: list[dict[str, object]] = []
+    offset = 0
+    while offset + 5 <= len(payload):
+        payload_size = int.from_bytes(payload[offset + 1 : offset + 5], "big")
+        payload_start = offset + 5
+        payload_end = payload_start + payload_size
+        if payload_end > len(payload):
+            break
+        offset = payload_end
+        try:
+            frame = json.loads(payload[payload_start:payload_end])
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(frame, dict):
+            frames.append(frame)
+    return frames
+
+
+def _kimi_connect_answer_parts(payload: bytes) -> tuple[str, str]:
+    """从 Kimi Connect 帧分别重建正式回答和思考文本。
+
+    Kimi 会在同一助手消息中交替发送 ``block.think`` 与 ``block.text``。两者都
+    是模型生成内容，但只有 ``block.text`` 是面向最终用户的回答；把思考写入正文会
+    直接污染品牌提及判断和答案浏览。思考文本只作为可选的独立结果返回，供业务界面
+    默认折叠展示，绝不以任意 ``content`` 字段的泛化匹配来猜测边界。
+    """
+
+    answer_fragments: list[str] = []
+    reasoning_fragments: list[str] = []
+    assistant_message_seen = False
+    for frame in _kimi_connect_json_frames(payload):
+        message = frame.get("message")
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            assistant_message_seen = True
+        if not assistant_message_seen:
+            continue
+        mask = frame.get("mask")
+        block = frame.get("block")
+        if not isinstance(block, dict):
+            continue
+        if mask in {"block.text", "block.text.content"}:
+            text = block.get("text")
+            content = text.get("content") if isinstance(text, dict) else None
+            if isinstance(content, str):
+                answer_fragments.append(content)
+        elif mask in {"block.think", "block.think.content"}:
+            think = block.get("think")
+            content = think.get("content") if isinstance(think, dict) else None
+            if isinstance(content, str):
+                reasoning_fragments.append(content)
+    answer = _KIMI_INLINE_CITATION_PATTERN.sub("", _merge_stream_fragments(answer_fragments))
+    return answer, _merge_stream_fragments(reasoning_fragments)
 
 
 def _yuanbao_answer_from_payload(payload: str) -> str:
@@ -1079,29 +1141,50 @@ def _wenxin_answer_from_payload(payload: str) -> str:
     return _merge_stream_fragments(fragments)
 
 
-def _network_answer_from_payload(payload: str, policy: NetworkAnswerPolicy) -> str:
+def _network_answer_from_payload(payload: str | bytes, policy: NetworkAnswerPolicy) -> str:
     """从受限聊天响应中提取 Markdown 正文。
 
     原始响应仅在此函数调用链中短暂存在。字段白名单和最小长度共同防止把协议状态、
     工具元数据或网站工作台文案作为回答交付。
     """
 
+    payload_text = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else payload
     if policy.parser is NetworkAnswerParser.DOUBAO_CONTENT_BLOCK_EVENT:
-        answer = _doubao_answer_from_payload(payload)
+        answer = _doubao_answer_from_payload(payload_text)
     elif policy.parser is NetworkAnswerParser.DEEPSEEK_CONTENT_EVENT:
-        answer = _deepseek_answer_from_payload(payload)
-        if not _deepseek_stream_is_finished(payload):
+        answer = _deepseek_answer_from_payload(payload_text)
+        if not _deepseek_stream_is_finished(payload_text):
             answer = ""
+    elif policy.parser is NetworkAnswerParser.KIMI_CONNECT_TEXT_EVENT:
+        # Connect 帧头是二进制长度字段，必须使用原始字节解析；先 decode 会破坏长度边界。
+        raw_payload = payload if isinstance(payload, bytes) else payload.encode("utf-8")
+        if len(raw_payload) >= 5 and 5 + int.from_bytes(raw_payload[1:5], "big") <= len(raw_payload):
+            answer, _ = _kimi_connect_answer_parts(raw_payload)
+        else:
+            # Kimi 保留的 SSE 端点不是 Connect 二进制流；维持既有兼容读取，避免因
+            # 平台灰度回退把本可交付的回答错误标为空。该格式没有稳定思考字段，因而
+            # 不会返回 reasoning。
+            fragments = [_decode_json_string(match) for match in _ANSWER_FIELD_PATTERN.findall(payload_text)]
+            answer = _merge_stream_fragments(fragments)
     elif policy.parser is NetworkAnswerParser.QIANWEN_IFRAME_EVENT:
-        answer = _qianwen_answer_from_payload(payload)
+        answer = _qianwen_answer_from_payload(payload_text)
     elif policy.parser is NetworkAnswerParser.YUANBAO_TEXT_EVENT:
-        answer = _yuanbao_answer_from_payload(payload)
+        answer = _yuanbao_answer_from_payload(payload_text)
     elif policy.parser is NetworkAnswerParser.WENXIN_MARKDOWN_EVENT:
-        answer = _wenxin_answer_from_payload(payload)
+        answer = _wenxin_answer_from_payload(payload_text)
     else:
-        fragments = [_decode_json_string(match) for match in _ANSWER_FIELD_PATTERN.findall(payload)]
+        fragments = [_decode_json_string(match) for match in _ANSWER_FIELD_PATTERN.findall(payload_text)]
         answer = _merge_stream_fragments(fragments)
     return answer if len(answer) >= policy.minimum_answer_characters else ""
+
+
+def _network_reasoning_from_payload(payload: bytes, policy: NetworkAnswerPolicy) -> str | None:
+    """提取可单独展示的模型思考文本；其他平台没有稳定协议时不猜测。"""
+
+    if policy.parser is not NetworkAnswerParser.KIMI_CONNECT_TEXT_EVENT:
+        return None
+    _, reasoning = _kimi_connect_answer_parts(payload)
+    return reasoning or None
 
 
 def _append_citation(
@@ -1123,6 +1206,68 @@ def _append_citation(
         return
     seen_urls.add(normalized_url)
     citations.append({"url": normalized_url, "title": normalized_title})
+
+
+def _collect_kimi_search_chunk_citations(
+    value: object,
+    citations: list[Citation],
+    seen_urls: set[str],
+    *,
+    depth: int = 0,
+) -> None:
+    """仅在 Kimi ``searchChunks`` 内读取同一来源对象的 URL 与标题。
+
+    Connect 帧还包含会话、工具和正文对象。递归范围严格限定在已审查的
+    ``message.refs.searchChunks``，并要求 URL、标题位于同一对象，避免将不相干字段
+    拼成错误引用。
+    """
+
+    if depth > 5:
+        return
+    if isinstance(value, Mapping):
+        url = next(
+            (
+                value.get(field)
+                for field in ("url", "link", "webUrl", "websiteUrl")
+                if isinstance(value.get(field), str)
+            ),
+            None,
+        )
+        title = next(
+            (
+                value.get(field)
+                for field in ("title", "name", "sourceName", "source")
+                if isinstance(value.get(field), str)
+            ),
+            None,
+        )
+        _append_citation(citations, seen_urls, url, title)
+        for child in value.values():
+            if isinstance(child, (Mapping, list)):
+                _collect_kimi_search_chunk_citations(
+                    child, citations, seen_urls, depth=depth + 1
+                )
+    elif isinstance(value, list):
+        for child in value:
+            _collect_kimi_search_chunk_citations(child, citations, seen_urls, depth=depth + 1)
+
+
+def _kimi_connect_citations(payload: bytes) -> list[Citation]:
+    """从 Kimi Connect 的 ``message.refs.searchChunks`` 生成可展示的来源卡片。"""
+
+    citations: list[Citation] = []
+    seen_urls: set[str] = set()
+    for frame in _kimi_connect_json_frames(payload):
+        message = frame.get("message")
+        if not isinstance(message, Mapping):
+            continue
+        refs = message.get("refs")
+        if not isinstance(refs, Mapping):
+            continue
+        search_chunks = refs.get("searchChunks")
+        if isinstance(search_chunks, list):
+            _collect_kimi_search_chunk_citations(search_chunks, citations, seen_urls)
+    return citations[:50]
 
 
 def _collect_doubao_citations(
@@ -1278,18 +1423,25 @@ def _collect_wenxin_citations(
 
 
 def _network_citations_from_payload(
-    payload: str, parser: NetworkAnswerParser | None = None
+    payload: str | bytes, parser: NetworkAnswerParser | None = None
 ) -> list[Citation]:
     """提取响应中紧邻 URL 的标题字段，并按 URL 去重。"""
 
+    if parser is NetworkAnswerParser.KIMI_CONNECT_TEXT_EVENT:
+        raw_payload = payload if isinstance(payload, bytes) else payload.encode("utf-8")
+        if len(raw_payload) >= 5 and 5 + int.from_bytes(raw_payload[1:5], "big") <= len(raw_payload):
+            return _kimi_connect_citations(raw_payload)
+
+    payload_text = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else payload
+
     citations: list[Citation] = []
     seen_urls: set[str] = set()
-    for raw_url, raw_title in _CITATION_PATTERN.findall(payload):
+    for raw_url, raw_title in _CITATION_PATTERN.findall(payload_text):
         url = _decode_json_string(raw_url).strip()
         title = _decode_json_string(raw_title).strip()
         _append_citation(citations, seen_urls, url, title)
     if parser is NetworkAnswerParser.DOUBAO_CONTENT_BLOCK_EVENT:
-        for raw_event in _SSE_DATA_PATTERN.findall(payload):
+        for raw_event in _SSE_DATA_PATTERN.findall(payload_text):
             if raw_event == "[DONE]":
                 continue
             try:
@@ -1298,14 +1450,14 @@ def _network_citations_from_payload(
                 continue
             _collect_doubao_citations(event, citations, seen_urls)
     elif parser is NetworkAnswerParser.YUANBAO_TEXT_EVENT:
-        for raw_title, raw_url in _YUANBAO_BUBBLE_CITATION_PATTERN.findall(payload):
+        for raw_title, raw_url in _YUANBAO_BUBBLE_CITATION_PATTERN.findall(payload_text):
             _append_citation(
                 citations,
                 seen_urls,
                 _decode_json_string(raw_url),
                 _decode_json_string(raw_title),
             )
-        for raw_event in _SSE_DATA_PATTERN.findall(payload):
+        for raw_event in _SSE_DATA_PATTERN.findall(payload_text):
             if raw_event == "[DONE]":
                 continue
             try:
@@ -1331,6 +1483,7 @@ class NetworkAnswer:
 
     markdown: str
     citations: list[Citation]
+    reasoning: str | None = None
 
 
 class NetworkAnswerListener:
@@ -1405,8 +1558,9 @@ class NetworkAnswerListener:
                 self._completed.set()
                 return
             payload = body.decode("utf-8", errors="replace")
-            answer = _network_answer_from_payload(payload, self._policy)
-            citations = _network_citations_from_payload(payload, self._policy.parser)
+            answer = _network_answer_from_payload(body, self._policy)
+            reasoning = _network_reasoning_from_payload(body, self._policy)
+            citations = _network_citations_from_payload(body, self._policy.parser)
             if not answer and self._result is None:
                 if self._policy.parser is NetworkAnswerParser.YUANBAO_TEXT_EVENT:
                     for citation in citations:
@@ -1420,7 +1574,11 @@ class NetworkAnswerListener:
             # 通用结束帧，因此以受限响应自然结束作为其唯一可审计的完成信号。
             if self._result is None:
                 merged_citations = [*self._pending_citations, *citations]
-                self._result = NetworkAnswer(markdown=answer, citations=merged_citations[:50])
+                self._result = NetworkAnswer(
+                    markdown=answer,
+                    citations=merged_citations[:50],
+                    reasoning=reasoning,
+                )
                 if self._policy.parser is NetworkAnswerParser.YUANBAO_TEXT_EVENT:
                     # 让后续搜索响应有机会补齐来源；期间仍只保留清洗后的结构化数据。
                     await asyncio.sleep(YUANBAO_CITATION_GRACE_SECONDS)
@@ -1433,7 +1591,11 @@ class NetworkAnswerListener:
                         continue
                     seen_urls.add(citation["url"])
                     merged.append(citation)
-                self._result = NetworkAnswer(markdown=self._result.markdown, citations=merged[:50])
+                self._result = NetworkAnswer(
+                    markdown=self._result.markdown,
+                    citations=merged[:50],
+                    reasoning=self._result.reasoning,
+                )
         except Exception:
             # 不记录 URL、正文或异常字符串；这些内容可能含会话标识。失败只在任务级
             # 收敛为稳定错误码，由既有截图和人工认证流程处理。
